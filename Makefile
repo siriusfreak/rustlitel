@@ -7,6 +7,8 @@
 #   IMAGE       = rustlitel
 #   RELAY_URL   = https://relay.example.com
 #   CODESIGN    = op://vault/rustlitel-codesign
+#   UPDATE_PUBKEY         = <base64 ed25519 pubkey from `make update-keygen`>
+#   UPDATE_SIGNING_KEY_REF = op://vault/rustlitel-update-signing/private
 # The defaults below are placeholders so the repo exposes no real hosts.
 -include Makefile.local
 
@@ -16,6 +18,19 @@ RELAY_URL ?= https://relay.example.com
 CODESIGN  ?= op://vault/rustlitel-codesign
 CARGO     ?= cargo
 
+# Self-update signing. UPDATE_PUBKEY is baked into the agent/relay; the matching
+# private key (UPDATE_SIGNING_KEY_REF, a 1Password ref) stays offline and signs
+# release binaries via `make sign-agents`. Empty UPDATE_PUBKEY => agents refuse
+# to self-update (fail closed) until you generate a key with `make update-keygen`.
+UPDATE_PUBKEY          ?=
+UPDATE_SIGNING_KEY_REF ?= op://vault/rustlitel-update-signing/private
+
+# One build id + monotonic epoch for the whole release (image + agents + sigs),
+# so a self-updating agent converges and only ever moves to a strictly newer
+# build. Use the same commit for `image`, `agent-windows` and `sign-agents`.
+BUILD_ID    := $(shell git rev-parse --short HEAD 2>/dev/null || date +%Y%m%d%H%M%S)
+BUILD_EPOCH := $(shell git log -1 --format=%ct 2>/dev/null || date +%s)
+
 .PHONY: help
 help:
 	@echo "Targets:"
@@ -24,6 +39,8 @@ help:
 	@echo "  ui               build the egui/WASM UI bundle (needs trunk + wasm target)"
 	@echo "  image            build + push the relay image to the private registry"
 	@echo "  agent-windows    cross-build the Windows agent .exe (needs the target + linker)"
+	@echo "  update-keygen    generate the ed25519 self-update signing key (one-time)"
+	@echo "  sign-agents      ed25519-sign the dist/ agent binaries for self-update"
 	@echo "  run-relay        run the relay locally (needs RUSTLITEL_OPERATOR_TOKEN, RUSTLITEL_AGENT_TOKEN)"
 	@echo "  run-agent        run the agent locally (needs RUSTLITEL_RELAY, RUSTLITEL_AGENT_TOKEN)"
 	@echo "  gen-tokens       print two fresh random tokens"
@@ -53,7 +70,9 @@ ui:
 .PHONY: image
 image: ui
 	docker buildx build --platform linux/amd64 --provenance=false --sbom=false \
-	  --build-arg RUSTLITEL_BUILD_ID=$$(git rev-parse --short HEAD 2>/dev/null || date +%Y%m%d%H%M%S) \
+	  --build-arg RUSTLITEL_BUILD_ID=$(BUILD_ID) \
+	  --build-arg RUSTLITEL_BUILD_EPOCH=$(BUILD_EPOCH) \
+	  --build-arg RUSTLITEL_UPDATE_PUBKEY=$(UPDATE_PUBKEY) \
 	  -t $(REGISTRY)/$(IMAGE):latest \
 	  -t $(REGISTRY)/$(IMAGE):$$(date +%Y%m%d) \
 	  --output type=registry .
@@ -67,9 +86,34 @@ image: ui
 # you `make image` from.
 .PHONY: agent-windows
 agent-windows:
-	RUSTLITEL_BUILD_ID=$$(git rev-parse --short HEAD 2>/dev/null || date +%Y%m%d%H%M%S) \
+	RUSTLITEL_BUILD_ID=$(BUILD_ID) \
+	RUSTLITEL_BUILD_EPOCH=$(BUILD_EPOCH) \
+	RUSTLITEL_UPDATE_PUBKEY=$(UPDATE_PUBKEY) \
 	  $(CARGO) build --release -p rustlitel-agent --target x86_64-pc-windows-gnu
 	@echo "-> target/x86_64-pc-windows-gnu/release/rustlitel-agent.exe"
+
+# One-time: generate the ed25519 self-update signing key. Store the PRIVATE key
+# in 1Password at UPDATE_SIGNING_KEY_REF and put UPDATE_PUBKEY in Makefile.local.
+.PHONY: update-keygen
+update-keygen:
+	$(CARGO) run --release -q -p rustlitel-update-sign -- keygen
+
+# ed25519-sign the staged agent binaries for self-update, writing
+# dist/<binary>.sig.json next to each (the relay serves these from /srv/agents,
+# and the agent verifies the signature against the baked UPDATE_PUBKEY before
+# swapping). Signs whichever of the stock binaries are present in dist/. Run
+# from the same commit as `image`/`agent-windows` so BUILD_ID/BUILD_EPOCH match
+# the baked values. The private key is read from 1Password, never stored.
+.PHONY: sign-agents
+sign-agents:
+	@test -n "$(UPDATE_PUBKEY)" || { echo "UPDATE_PUBKEY is empty — run 'make update-keygen' and set it in Makefile.local"; exit 1; }
+	@key="$$(op read '$(UPDATE_SIGNING_KEY_REF)')"; \
+	for f in dist/rustlitel-agent-windows.exe dist/rustlitel-agent-linux dist/rustlitel-agent-macos; do \
+	  [ -f "$$f" ] || continue; \
+	  RUSTLITEL_UPDATE_SIGNING_KEY="$$key" \
+	    $(CARGO) run --release -q -p rustlitel-update-sign -- \
+	    sign --version "$(BUILD_ID)" --build-epoch "$(BUILD_EPOCH)" "$$f"; \
+	done
 
 # Authenticode-sign the bundled Windows agent with the code-signing cert stored
 # in 1Password (set CODESIGN in Makefile.local), with an RFC3161 timestamp. Run

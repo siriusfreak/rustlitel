@@ -28,6 +28,34 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// pulls a fresh binary when they differ.
 pub const BUILD_ID: &str = env!("RUSTLITEL_BUILD_ID");
 
+/// Monotonic build epoch (a unix timestamp by default; see `build.rs`). A
+/// self-updating agent installs a relay's build only when its epoch is
+/// *strictly greater* than the agent's own, so a rolled-back or hostile relay
+/// cannot force a downgrade to an older, known-vulnerable build.
+pub fn build_epoch() -> u64 {
+    env!("RUSTLITEL_BUILD_EPOCH").parse().unwrap_or(0)
+}
+
+/// Base64 (standard) ed25519 public key the agent verifies a self-update
+/// signature against, baked in at build time. Empty when update signing isn't
+/// configured — the agent then refuses to self-update (fail closed), because an
+/// unsigned update would reduce to "trust whatever the relay serves".
+pub const UPDATE_PUBKEY: &str = env!("RUSTLITEL_UPDATE_PUBKEY");
+
+/// Context prefix mixed into the signed self-update message, so an ed25519
+/// signature can never be confused with a signature over anything else.
+pub const UPDATE_SIG_CONTEXT: &str = "rustlitel-update-v1";
+
+/// Build the exact bytes an update signature covers: the context, version,
+/// epoch, binary sha256 (lowercase hex) and size, one per line. Both the
+/// offline signer and the agent reconstruct this identically.
+pub fn update_signing_message(version: &str, build_epoch: u64, sha256_hex: &str, size: u64) -> String {
+    format!(
+        "{UPDATE_SIG_CONTEXT}\n{version}\n{build_epoch}\n{}\n{size}",
+        sha256_hex.to_ascii_lowercase()
+    )
+}
+
 /// First frame the agent sends on the control link, right after connecting.
 ///
 /// The relay validates `token` (constant-time) before registering the agent;

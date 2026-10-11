@@ -1,0 +1,23 @@
+[package]
+name = "rustlitel-update-sign"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Host-only release tool: generate the self-update signing key and sign agent
+# binaries offline (the private key never touches the relay). Not in the
+# workspace default set; run it explicitly from the Makefile.
+
+[[bin]]
+name = "rustlitel-update-sign"
+path = "src/main.rs"
+
+[dependencies]
+rustlitel-proto = { path = "../proto" }
+anyhow = { workspace = true }
+clap = { version = "4", features = ["derive", "env"] }
+ring = "0.17"
+base64 = "0.22"
+sha2 = "0.10"
+serde = { workspace = true }
+serde_json = { workspace = true }

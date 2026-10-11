@@ -2,6 +2,8 @@
 /dist
 /crates/ui/dist
 /Makefile.local
+# Pre-fix vulnerability report — keep local, don't publish to the public repo.
+/SECURITY-AUDIT.md
 **/*.rs.bk
 *.pdb
 .DS_Store

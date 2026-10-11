@@ -39,6 +39,16 @@ pub async fn run(
 
     let mut cmd = CommandBuilder::new(shell);
     cmd.env("TERM", "xterm-256color");
+    // Keep the agent's own config (notably the enrollment token / its path) out
+    // of the interactive shell's environment.
+    for k in [
+        "RUSTLITEL_AGENT_TOKEN",
+        "RUSTLITEL_AGENT_TOKEN_FILE",
+        "RUSTLITEL_RELAY",
+        "RUSTLITEL_LOG",
+    ] {
+        cmd.env_remove(k);
+    }
     if let Some(home) = dirs_home() {
         cmd.cwd(home);
     }

@@ -34,11 +34,12 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let listen = env_or("RUSTLITEL_LISTEN_ADDR", "0.0.0.0:8080");
-    let operator_token = require_env("RUSTLITEL_OPERATOR_TOKEN")?;
-    let agent_token = require_env("RUSTLITEL_AGENT_TOKEN")?;
+    let operator_token = require_token("RUSTLITEL_OPERATOR_TOKEN")?;
+    let agent_token = require_token("RUSTLITEL_AGENT_TOKEN")?;
     let public_origin = std::env::var("RUSTLITEL_PUBLIC_ORIGIN").ok().filter(|s| !s.is_empty());
     let ttl_hours: u64 = env_or("RUSTLITEL_SESSION_TTL_HOURS", "12").parse().unwrap_or(12);
     let cookie_secure = env_or("RUSTLITEL_COOKIE_SECURE", "1") != "0";
+    let max_agents: usize = env_or("RUSTLITEL_MAX_AGENTS", "512").parse().unwrap_or(512);
     let open_timeout_secs: u64 = env_or("RUSTLITEL_OPEN_TIMEOUT_SECS", "30").parse().unwrap_or(30);
     let exec_output_cap: usize = env_or("RUSTLITEL_EXEC_OUTPUT_CAP", "1048576")
         .parse()
@@ -50,16 +51,45 @@ async fn main() -> anyhow::Result<()> {
     let ui_dir = env_or("RUSTLITEL_UI_DIR", "/srv/ui");
     let short_link_ttl_days: u64 = env_or("RUSTLITEL_SHORT_LINK_TTL_DAYS", "7").parse().unwrap_or(7);
 
-    let oidc = oidc::OidcConfig::from_env().map(oidc::Oidc::new);
-    if oidc.is_some() {
-        tracing::info!("OIDC operator login enabled");
-    } else {
-        tracing::info!("OIDC not configured; using operator-token login");
-    }
-
     if operator_token == agent_token {
         anyhow::bail!("RUSTLITEL_OPERATOR_TOKEN and RUSTLITEL_AGENT_TOKEN must differ");
     }
+
+    // Fail closed in production: behind TLS (secure cookies) we cannot enforce
+    // the WebSocket/login Origin check without knowing our own origin, so
+    // require it to be set rather than silently skipping the check.
+    if cookie_secure && public_origin.is_none() {
+        anyhow::bail!(
+            "RUSTLITEL_PUBLIC_ORIGIN must be set when RUSTLITEL_COOKIE_SECURE is on \
+             (production), so Origin checks are enforced; set it to e.g. \
+             https://relay.example.com, or set RUSTLITEL_COOKIE_SECURE=0 for local HTTP"
+        );
+    }
+
+    let oidc = match oidc::OidcConfig::from_env() {
+        Some(cfg) => {
+            cfg.validate()?;
+            // A remote-shell tool must not silently grant every realm user:
+            // require a group unless the operator explicitly opts into any-user.
+            if cfg.allowed_group.is_empty()
+                && env_or("RUSTLITEL_OIDC_ALLOW_ANY_USER", "0") != "1"
+            {
+                anyhow::bail!(
+                    "OIDC is enabled but RUSTLITEL_OIDC_ALLOWED_GROUP is empty, which would \
+                     make every authenticated realm user a full operator. Set the required \
+                     group, or set RUSTLITEL_OIDC_ALLOW_ANY_USER=1 to intentionally allow all."
+                );
+            }
+            // The login-state cookie is signed with a server-side secret; derive
+            // it from the operator token so no extra config is needed.
+            tracing::info!("OIDC operator login enabled");
+            Some(oidc::Oidc::new(cfg, operator_token.clone()))
+        }
+        None => {
+            tracing::info!("OIDC not configured; using operator-token login");
+            None
+        }
+    };
 
     let state = Arc::new(AppState {
         agents: Mutex::new(HashMap::new()),
@@ -80,7 +110,7 @@ async fn main() -> anyhow::Result<()> {
         oidc,
         short_links: Mutex::new(HashMap::new()),
         short_link_ttl: Duration::from_secs(short_link_ttl_days * 86400),
-        oidc_cli_client_id: env_or("RUSTLITEL_OIDC_CLI_CLIENT_ID", "rustlitel-cli"),
+        max_agents,
     });
 
     let app = Router::new()
@@ -127,6 +157,16 @@ fn require_env(key: &str) -> anyhow::Result<String> {
         .ok()
         .filter(|s| !s.is_empty())
         .ok_or_else(|| anyhow::anyhow!("{key} is required"))
+}
+
+/// A required secret token with a minimum entropy floor, so a trivially short
+/// token can't be configured despite the constant-time compare.
+fn require_token(key: &str) -> anyhow::Result<String> {
+    let v = require_env(key)?;
+    if v.len() < 16 {
+        anyhow::bail!("{key} must be at least 16 characters (use `make gen-tokens`)");
+    }
+    Ok(v)
 }
 
 /// Resolve on Ctrl-C or SIGTERM (k8s rolling update / pod shutdown).

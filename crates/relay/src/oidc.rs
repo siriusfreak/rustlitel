@@ -7,21 +7,34 @@
 //! switches to "Sign in with Keycloak" when this is configured; scripts keep
 //! using the Bearer operator token for `/api/exec`.
 //!
+//! The per-login secrets (`state`/`nonce`/PKCE verifier/return-to) are carried
+//! in a short-lived, HMAC-signed, HttpOnly cookie — not in relay memory — so a
+//! relay restart/rollout or a second replica never invalidates an in-flight
+//! login, and the login is bound to the browser that started it (closing a
+//! login-CSRF/fixation gap).
+//!
 //! Enabled only when the `RUSTLITEL_OIDC_*` env is present, so the operator-token
 //! login keeps working until Keycloak is wired up.
 
-use std::collections::HashMap;
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64U;
 use base64::Engine;
+use hmac::{Hmac, Mac};
 use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 use rand::RngCore;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 use url::Url;
+
+type HmacSha256 = Hmac<Sha256>;
+
+/// Name of the short-lived cookie carrying the signed login state.
+pub const LOGIN_COOKIE: &str = "rustlitel_login";
+/// How long a started login may take to complete (seconds).
+pub const LOGIN_TTL_SECS: u64 = 600;
 
 pub struct OidcConfig {
     pub issuer: String,
@@ -32,6 +45,9 @@ pub struct OidcConfig {
     pub allowed_group: String,
     pub username_claim: String,
     pub groups_claim: String,
+    /// Public client id the `rustlitel` CLI uses for its device-flow login; its
+    /// access tokens are also accepted on the API, so it is an allowed audience.
+    pub cli_client_id: String,
 }
 
 impl OidcConfig {
@@ -48,15 +64,39 @@ impl OidcConfig {
             .trim_end_matches('/')
             .strip_suffix("/.well-known/openid-configuration")
             .unwrap_or_else(|| issuer.trim().trim_end_matches('/'));
+        let issuer = issuer.trim_end_matches('/').to_string();
         Some(Self {
-            issuer: issuer.trim_end_matches('/').to_string(),
+            issuer,
             client_id,
             client_secret,
             redirect_url,
             allowed_group: std::env::var("RUSTLITEL_OIDC_ALLOWED_GROUP").unwrap_or_default(),
             username_claim: env_or("RUSTLITEL_OIDC_USERNAME_CLAIM", "preferred_username"),
             groups_claim: env_or("RUSTLITEL_OIDC_GROUPS_CLAIM", "groups"),
+            cli_client_id: env_or("RUSTLITEL_OIDC_CLI_CLIENT_ID", "rustlitel-cli"),
         })
+    }
+
+    /// Reject a cleartext issuer (discovery/JWKS/token would travel in the
+    /// clear). A loopback issuer is allowed for local development.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.issuer.starts_with("https://") {
+            return Ok(());
+        }
+        let loopback = self
+            .issuer
+            .strip_prefix("http://")
+            .map(|rest| {
+                rest.starts_with("localhost")
+                    || rest.starts_with("127.0.0.1")
+                    || rest.starts_with("[::1]")
+            })
+            .unwrap_or(false);
+        if loopback {
+            Ok(())
+        } else {
+            bail!("RUSTLITEL_OIDC_ISSUER must be https:// (got {})", self.issuer)
+        }
     }
 }
 
@@ -81,11 +121,15 @@ struct Jwks {
     keys: Vec<Jwk>,
 }
 
-struct Pending {
+/// The per-login secrets, carried in a signed cookie (not relay memory).
+#[derive(Serialize, Deserialize)]
+struct LoginState {
+    state: String,
     nonce: String,
     pkce_verifier: String,
     return_to: String,
-    created: Instant,
+    /// Unix seconds when this login attempt expires.
+    exp: u64,
 }
 
 pub struct Oidc {
@@ -93,7 +137,8 @@ pub struct Oidc {
     http: reqwest::Client,
     disc: tokio::sync::OnceCell<Discovery>,
     jwks: Mutex<Vec<Jwk>>,
-    pending: Mutex<HashMap<String, Pending>>,
+    /// HMAC key for the signed login-state cookie (a server-side secret).
+    state_secret: String,
 }
 
 /// Verified identity extracted from an ID token.
@@ -103,13 +148,13 @@ pub struct Identity {
 }
 
 impl Oidc {
-    pub fn new(cfg: OidcConfig) -> Self {
+    pub fn new(cfg: OidcConfig, state_secret: String) -> Self {
         Self {
             cfg,
             http: reqwest::Client::new(),
             disc: tokio::sync::OnceCell::new(),
             jwks: Mutex::new(Vec::new()),
-            pending: Mutex::new(HashMap::new()),
+            state_secret,
         }
     }
 
@@ -131,24 +176,22 @@ impl Oidc {
             .await
     }
 
-    /// Build the authorize URL and remember the per-login state.
-    pub async fn begin_login(&self, return_to: &str) -> anyhow::Result<String> {
+    /// Build the authorize URL and the signed login-state cookie value to set.
+    pub async fn begin_login(&self, return_to: &str) -> anyhow::Result<(String, String)> {
         let disc = self.discovery().await?;
         let state = rand_tok();
         let nonce = rand_tok();
         let verifier = rand_verifier();
         let challenge = B64U.encode(Sha256::digest(verifier.as_bytes()));
 
-        self.pending.lock().unwrap().insert(
-            state.clone(),
-            Pending {
-                nonce: nonce.clone(),
-                pkce_verifier: verifier,
-                return_to: sanitize_return(return_to),
-                created: Instant::now(),
-            },
-        );
-        self.gc_pending();
+        let ls = LoginState {
+            state: state.clone(),
+            nonce: nonce.clone(),
+            pkce_verifier: verifier,
+            return_to: sanitize_return(return_to),
+            exp: now() + LOGIN_TTL_SECS,
+        };
+        let cookie = self.sign_state(&ls);
 
         let mut u = Url::parse(&disc.authorization_endpoint).context("auth endpoint url")?;
         u.query_pairs_mut()
@@ -160,20 +203,30 @@ impl Oidc {
             .append_pair("nonce", &nonce)
             .append_pair("code_challenge", &challenge)
             .append_pair("code_challenge_method", "S256");
-        Ok(u.to_string())
+        Ok((u.to_string(), cookie))
     }
 
-    /// Exchange the code, verify the ID token, enforce the group. Returns the
-    /// identity and where to send the browser next.
-    pub async fn complete_login(&self, code: &str, state: &str) -> anyhow::Result<(Identity, String)> {
-        let pending = self
-            .pending
-            .lock()
-            .unwrap()
-            .remove(state)
-            .ok_or_else(|| anyhow!("unknown or reused login state"))?;
-        if pending.created.elapsed() > Duration::from_secs(600) {
+    /// Exchange the code, verify the ID token, enforce the group. The login
+    /// state comes from the signed cookie set at `begin_login`; the `state`
+    /// query param must match it (CSRF / browser binding). Returns the identity
+    /// and where to send the browser next.
+    pub async fn complete_login(
+        &self,
+        code: &str,
+        state: &str,
+        cookie: Option<&str>,
+    ) -> anyhow::Result<(Identity, String)> {
+        let cookie = cookie.ok_or_else(|| anyhow!("missing login state"))?;
+        let ls = self
+            .verify_state(cookie)
+            .ok_or_else(|| anyhow!("invalid login state"))?;
+        if ls.exp <= now() {
             bail!("login attempt expired");
+        }
+        // Bind the returned `state` to the browser's signed cookie.
+        let state_ok: bool = state.as_bytes().ct_eq(ls.state.as_bytes()).into();
+        if !state_ok {
+            bail!("login state mismatch");
         }
 
         let disc = self.discovery().await?;
@@ -183,7 +236,7 @@ impl Oidc {
             ("grant_type", "authorization_code"),
             ("code", code),
             ("redirect_uri", self.cfg.redirect_url.as_str()),
-            ("code_verifier", pending.pkce_verifier.as_str()),
+            ("code_verifier", ls.pkce_verifier.as_str()),
         ];
         let resp = self
             .http
@@ -196,9 +249,10 @@ impl Oidc {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
         if !status.is_success() {
-            // Keycloak returns {"error":...,"error_description":...}; surface it.
+            // Log the IdP detail server-side; don't reflect it to the browser.
             let snippet: String = body.chars().take(300).collect();
-            bail!("token endpoint {}: {}", status.as_u16(), snippet);
+            tracing::warn!(status = %status.as_u16(), "token endpoint error: {snippet}");
+            bail!("token exchange failed");
         }
         #[derive(Deserialize)]
         struct TokenResp {
@@ -208,7 +262,7 @@ impl Oidc {
         }
         let tok: TokenResp = serde_json::from_str(&body).context("parse token response")?;
 
-        let mut identity = self.verify_id_token(&tok.id_token, &pending.nonce).await?;
+        let mut identity = self.verify_id_token(&tok.id_token, &ls.nonce).await?;
 
         // Keycloak puts realm roles in the access token by default, not the ID
         // token, so merge those in for the group check.
@@ -227,15 +281,15 @@ impl Oidc {
                     || g.trim_start_matches('/') == want
             });
             if !ok {
-                bail!(
-                    "'{}' is not in the required group '{}' (token groups: {:?})",
-                    identity.username,
-                    self.cfg.allowed_group,
-                    identity.groups
+                tracing::warn!(
+                    user = %identity.username,
+                    "login denied: not in required group '{}'",
+                    self.cfg.allowed_group
                 );
+                bail!("you are not in the required group");
             }
         }
-        Ok((identity, pending.return_to))
+        Ok((identity, ls.return_to))
     }
 
     async fn verify_id_token(&self, jwt: &str, nonce: &str) -> anyhow::Result<Identity> {
@@ -277,8 +331,9 @@ impl Oidc {
     }
 
     /// Best-effort group/role extraction from the access token: verify its
-    /// signature + issuer (Keycloak access-token `aud` varies, so skip it),
-    /// then read `groups` and `realm_access.roles`. On any failure, no groups.
+    /// signature + issuer, confirm it was issued to one of our clients
+    /// (azp/aud), then read `groups` and `realm_access.roles`. On any failure,
+    /// no groups.
     async fn access_token_groups(&self, jwt: &str) -> Vec<String> {
         let Ok(header) = decode_header(jwt) else {
             return Vec::new();
@@ -299,18 +354,22 @@ impl Oidc {
         let Ok(key) = DecodingKey::from_rsa_components(&jwk.n, &jwk.e) else {
             return Vec::new();
         };
+        // Keycloak access-token `aud` varies, so validate the authorized party
+        // (azp)/audience ourselves against our own client ids below.
         let mut val = Validation::new(Algorithm::RS256);
         val.set_issuer(&[self.cfg.issuer.as_str()]);
         val.validate_aud = false;
         match decode::<serde_json::Value>(jwt, &key, &val) {
-            Ok(data) => extract_groups(&data.claims, &self.cfg.groups_claim),
-            Err(_) => Vec::new(),
+            Ok(data) if self.audience_ok(&data.claims) => {
+                extract_groups(&data.claims, &self.cfg.groups_claim)
+            }
+            _ => Vec::new(),
         }
     }
 
-    /// Verify a Bearer *access* token (signature + issuer + expiry; access-token
-    /// `aud` varies in Keycloak so it is not checked) and enforce the group.
-    /// Used to authorize API clients like the `wrs` CLI. Returns the username.
+    /// Verify a Bearer *access* token (signature + issuer + expiry + that it was
+    /// issued to one of our clients) and enforce the group. Used to authorize
+    /// API clients like the `rustlitel` CLI. Returns the username.
     pub async fn authorize_bearer(&self, token: &str) -> Option<String> {
         let header = decode_header(token).ok()?;
         let kid = header.kid?;
@@ -324,9 +383,17 @@ impl Oidc {
         let key = DecodingKey::from_rsa_components(&jwk.n, &jwk.e).ok()?;
         let mut val = Validation::new(Algorithm::RS256);
         val.set_issuer(&[self.cfg.issuer.as_str()]);
+        // Keycloak access-token `aud` varies; we check azp/aud ourselves.
         val.validate_aud = false;
         let data = decode::<serde_json::Value>(token, &key, &val).ok()?;
         let c = data.claims;
+
+        // The token must have been issued to one of our own clients — otherwise
+        // a token minted for a *different* client in the same realm would be
+        // accepted here (cross-client confusion).
+        if !self.audience_ok(&c) {
+            return None;
+        }
 
         if !self.cfg.allowed_group.is_empty() {
             let groups = extract_groups(&c, &self.cfg.groups_claim);
@@ -349,11 +416,28 @@ impl Oidc {
         )
     }
 
+    /// True if the token's `azp` (authorized party) — or, absent that, its
+    /// `aud` — names one of our own clients (the web client or the CLI client).
+    fn audience_ok(&self, c: &serde_json::Value) -> bool {
+        let allowed = [self.cfg.client_id.as_str(), self.cfg.cli_client_id.as_str()];
+        if let Some(azp) = c.get("azp").and_then(|v| v.as_str()) {
+            return allowed.contains(&azp);
+        }
+        match c.get("aud") {
+            Some(serde_json::Value::String(a)) => allowed.contains(&a.as_str()),
+            Some(serde_json::Value::Array(arr)) => arr
+                .iter()
+                .filter_map(|v| v.as_str())
+                .any(|a| allowed.contains(&a)),
+            _ => false,
+        }
+    }
+
     /// Public config the CLI needs to start a device-flow login.
-    pub fn public_config(&self, cli_client_id: &str) -> serde_json::Value {
+    pub fn public_config(&self) -> serde_json::Value {
         serde_json::json!({
             "issuer": self.cfg.issuer,
-            "cli_client_id": cli_client_id,
+            "cli_client_id": self.cfg.cli_client_id,
             "allowed_group": self.cfg.allowed_group,
         })
     }
@@ -377,9 +461,30 @@ impl Oidc {
         Ok(())
     }
 
-    fn gc_pending(&self) {
-        let mut p = self.pending.lock().unwrap();
-        p.retain(|_, v| v.created.elapsed() < Duration::from_secs(600));
+    // --- signed login-state cookie -----------------------------------------
+
+    fn sign_state(&self, ls: &LoginState) -> String {
+        let json = serde_json::to_vec(ls).expect("serialize login state");
+        let pb = B64U.encode(json);
+        let sig = self.state_mac(pb.as_bytes());
+        format!("{pb}.{sig}")
+    }
+
+    fn verify_state(&self, token: &str) -> Option<LoginState> {
+        let (pb, sig) = token.split_once('.')?;
+        let expected = self.state_mac(pb.as_bytes());
+        let ok: bool = expected.as_bytes().ct_eq(sig.as_bytes()).into();
+        if !ok {
+            return None;
+        }
+        let json = B64U.decode(pb).ok()?;
+        serde_json::from_slice(&json).ok()
+    }
+
+    fn state_mac(&self, data: &[u8]) -> String {
+        let mut mac = HmacSha256::new_from_slice(self.state_secret.as_bytes()).expect("hmac key");
+        mac.update(data);
+        B64U.encode(mac.finalize().into_bytes())
     }
 
     /// RP-initiated logout URL (ends the Keycloak session too), if advertised.
@@ -411,13 +516,26 @@ fn extract_groups(c: &serde_json::Value, claim: &str) -> Vec<String> {
     out
 }
 
-/// Only allow a same-origin path as the post-login redirect.
+/// Only allow a same-origin path as the post-login redirect. Rejects absolute
+/// URLs, scheme-relative `//host`, and the `/\host` backslash bypass (browsers
+/// normalise `\` to `/`, so `/\evil.com` would resolve to `//evil.com`).
 fn sanitize_return(path: &str) -> String {
-    if path.starts_with('/') && !path.starts_with("//") {
+    if path.starts_with('/')
+        && !path.starts_with("//")
+        && !path.contains('\\')
+        && !path.chars().any(|c| c.is_control())
+    {
         path.to_string()
     } else {
         "/".to_string()
     }
+}
+
+fn now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 fn rand_tok() -> String {
@@ -440,4 +558,74 @@ fn nonempty(key: &str) -> Option<String> {
 
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg() -> OidcConfig {
+        OidcConfig {
+            issuer: "https://kc.example/realms/main".into(),
+            client_id: "web".into(),
+            client_secret: "s".into(),
+            redirect_url: "https://r/oauth2/callback".into(),
+            allowed_group: String::new(),
+            username_claim: "preferred_username".into(),
+            groups_claim: "groups".into(),
+            cli_client_id: "rustlitel-cli".into(),
+        }
+    }
+
+    #[test]
+    fn login_state_cookie_roundtrip() {
+        let o = Oidc::new(cfg(), "server-secret".into());
+        let ls = LoginState {
+            state: "st".into(),
+            nonce: "no".into(),
+            pkce_verifier: "ve".into(),
+            return_to: "/".into(),
+            exp: now() + 60,
+        };
+        let token = o.sign_state(&ls);
+        let back = o.verify_state(&token).expect("verify");
+        assert_eq!(back.state, "st");
+        assert_eq!(back.pkce_verifier, "ve");
+        // Tamper → reject.
+        let mut bad = token.clone();
+        bad.push('x');
+        assert!(o.verify_state(&bad).is_none());
+        // Different secret → reject.
+        let o2 = Oidc::new(cfg(), "other".into());
+        assert!(o2.verify_state(&token).is_none());
+    }
+
+    #[test]
+    fn sanitize_return_blocks_bypasses() {
+        assert_eq!(sanitize_return("/app"), "/app");
+        assert_eq!(sanitize_return("//evil.com"), "/");
+        assert_eq!(sanitize_return("/\\evil.com"), "/");
+        assert_eq!(sanitize_return("https://evil.com"), "/");
+    }
+
+    #[test]
+    fn audience_checks_azp_then_aud() {
+        let o = Oidc::new(cfg(), "s".into());
+        assert!(o.audience_ok(&serde_json::json!({ "azp": "web" })));
+        assert!(o.audience_ok(&serde_json::json!({ "azp": "rustlitel-cli" })));
+        assert!(!o.audience_ok(&serde_json::json!({ "azp": "other-app" })));
+        assert!(o.audience_ok(&serde_json::json!({ "aud": ["account", "web"] })));
+        assert!(!o.audience_ok(&serde_json::json!({ "aud": "account" })));
+        assert!(!o.audience_ok(&serde_json::json!({})));
+    }
+
+    #[test]
+    fn issuer_scheme_enforced() {
+        let mut c = cfg();
+        assert!(c.validate().is_ok());
+        c.issuer = "http://keycloak.evil".into();
+        assert!(c.validate().is_err());
+        c.issuer = "http://localhost:8080/realms/main".into();
+        assert!(c.validate().is_ok());
+    }
 }

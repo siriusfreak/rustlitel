@@ -2728,12 +2728,14 @@ name = "rustlitel-agent"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "clap",
  "futures-util",
  "gethostname 0.5.0",
  "libc",
  "portable-pty",
  "reqwest",
+ "ring",
  "rustlitel-proto",
  "rustls",
  "serde",
@@ -2810,6 +2812,20 @@ dependencies = [
  "vt100",
  "wasm-bindgen-futures",
  "web-sys",
+]
+
+[[package]]
+name = "rustlitel-update-sign"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "clap",
+ "ring",
+ "rustlitel-proto",
+ "serde",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]

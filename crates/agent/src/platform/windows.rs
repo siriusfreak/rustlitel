@@ -151,6 +151,16 @@ fn do_install(src_exe: &Path, args: &RunArgs) -> anyhow::Result<bool> {
             .with_context(|| format!("copy agent to {}", target.display()))?;
     }
 
+    // Write the enrollment token to an admin-only file rather than onto the
+    // service command line (which Windows persists in the world-readable
+    // registry ImagePath). The service reads it via `--token-file`.
+    let token_path = install_dir().join("agent.token");
+    if let Some(tok) = args.token.as_deref().filter(|t| !t.is_empty()) {
+        std::fs::write(&token_path, tok)
+            .with_context(|| format!("write token file {}", token_path.display()))?;
+        restrict_acl(&token_path);
+    }
+
     let info = ServiceInfo {
         name: OsString::from(SERVICE_NAME),
         display_name: OsString::from(SERVICE_DISPLAY),
@@ -159,7 +169,7 @@ fn do_install(src_exe: &Path, args: &RunArgs) -> anyhow::Result<bool> {
         start_type: ServiceStartType::AutoStart,
         error_control: ServiceErrorControl::Normal,
         executable_path: target.clone(),
-        launch_arguments: service_launch_args(args),
+        launch_arguments: service_launch_args(args, &token_path),
         dependencies: vec![],
         account_name: None, // LocalSystem
         account_password: None,
@@ -194,6 +204,27 @@ fn same_file(a: &Path, b: &Path) -> bool {
     }
 }
 
+/// Lock a file down to SYSTEM + Administrators (drop inherited Users access), so
+/// a standard local user can't read it. Used for the enrollment-token file.
+/// Best-effort: a failure leaves the inherited ACL in place.
+fn restrict_acl(path: &Path) {
+    // Well-known SIDs (locale-independent): S-1-5-18 = LocalSystem,
+    // S-1-5-32-544 = BUILTIN\Administrators.
+    let status = std::process::Command::new("icacls")
+        .arg(path)
+        .args([
+            "/inheritance:r",
+            "/grant:r",
+            "*S-1-5-18:F",
+            "/grant:r",
+            "*S-1-5-32-544:F",
+        ])
+        .status();
+    if !matches!(status, Ok(s) if s.success()) {
+        tracing::warn!("could not restrict ACL on {}", path.display());
+    }
+}
+
 /// Best-effort removal of a previous `rustlitel-agent` service so install is idempotent.
 fn remove_existing(manager: &ServiceManager) {
     let Ok(svc) = manager.open_service(
@@ -213,17 +244,17 @@ fn remove_existing(manager: &ServiceManager) {
     std::thread::sleep(Duration::from_secs(1));
 }
 
-/// The command line the SCM will run at boot: `service --relay ... --token ...`.
-fn service_launch_args(args: &RunArgs) -> Vec<OsString> {
+/// The command line the SCM will run at boot: `service --relay ... --token-file ...`.
+/// The token is passed by *file path*, never inline, so it never lands in the
+/// registry ImagePath.
+fn service_launch_args(args: &RunArgs, token_path: &Path) -> Vec<OsString> {
     let mut v: Vec<OsString> = vec![OsString::from("service")];
     if let Some(relay) = &args.relay {
         v.push("--relay".into());
         v.push(relay.into());
     }
-    if let Some(token) = &args.token {
-        v.push("--token".into());
-        v.push(token.into());
-    }
+    v.push("--token-file".into());
+    v.push(token_path.into());
     if let Some(name) = &args.name {
         v.push("--name".into());
         v.push(name.into());

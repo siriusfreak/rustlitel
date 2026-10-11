@@ -69,6 +69,12 @@ pub struct RunArgs {
     #[arg(long, env = "RUSTLITEL_AGENT_TOKEN", global = true)]
     pub token: Option<String>,
 
+    /// Path to a file holding the enrollment token. Preferred over `--token` for
+    /// the installed service, so the secret never appears on the service command
+    /// line (and thus the world-readable registry ImagePath).
+    #[arg(long, env = "RUSTLITEL_AGENT_TOKEN_FILE", global = true)]
+    pub token_file: Option<std::path::PathBuf>,
+
     /// Display name in the web UI (defaults to the hostname).
     #[arg(long, global = true)]
     pub name: Option<String>,
@@ -155,9 +161,10 @@ fn block_on_foreground(args: RunArgs) {
 /// other platforms / `auto != "install"`, run in the foreground.
 fn run_from_embedded(cfg: InstallerConfig) {
     let auto = cfg.auto.clone().unwrap_or_else(|| "install".into());
-    let args = RunArgs {
+    let mut args = RunArgs {
         relay: Some(cfg.relay),
         token: Some(cfg.token),
+        token_file: None,
         name: cfg.name,
         id: None,
         shells: vec![],
@@ -169,10 +176,41 @@ fn run_from_embedded(cfg: InstallerConfig) {
     };
 
     if auto == "install" && cfg!(windows) {
+        // The Windows install path shows its own consent dialog.
         platform::install(args);
     } else {
+        // Foreground fallback: enabling remote access without the install
+        // dialog needs an explicit console consent. A double-clicked GUI binary
+        // has no TTY, so it stays listed-but-inert rather than silently opening
+        // a remote shell.
+        args.allow_remote = embedded_foreground_consent();
+        if !args.allow_remote {
+            args.self_update = false; // inert agents don't self-update either
+        }
         block_on_foreground(args);
     }
+}
+
+/// Ask, on the console, before a baked binary enables remote access on the
+/// foreground path. No TTY (or anything but y/yes) → declined (inert).
+fn embedded_foreground_consent() -> bool {
+    use std::io::{BufRead, IsTerminal, Write};
+    if !std::io::stdin().is_terminal() {
+        eprintln!(
+            "rustlitel-agent: no console to confirm remote access; starting WITHOUT it \
+             (listed but inert). Install the service for unattended access."
+        );
+        return false;
+    }
+    eprint!(
+        "Enable remote shell access to THIS machine for whoever holds the relay token? [y/N] "
+    );
+    let _ = std::io::stderr().flush();
+    let mut line = String::new();
+    if std::io::stdin().lock().read_line(&mut line).is_err() {
+        return false;
+    }
+    matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
 
 fn init_logging() {
@@ -220,11 +258,23 @@ pub async fn serve(args: RunArgs) {
     };
     let base_ws = relay.trim_end_matches('/').to_string();
 
+    // Never speak to a non-loopback relay over cleartext: the enrollment token
+    // travels in the Hello frame, and a cleartext channel also opens the agent
+    // to an update MITM.
+    if !relay_scheme_ok(&base_ws) {
+        tracing::error!(
+            "refusing to connect: relay must be wss:// (ws:// is allowed only for localhost): {base_ws}"
+        );
+        return;
+    }
+
     // Self-update (installed agents only): a periodic poller plus a check on
     // every (re)connect, so a relay rollout reaches agents within one reconnect.
-    let updater = args
-        .self_update
-        .then(|| args.token.clone())
+    // Only a remote-enabled agent self-updates: a self-updating agent is, by
+    // definition, remotely controllable, so it must not be done to a host that
+    // opted out of remote access.
+    let updater = (args.self_update && args.allow_remote)
+        .then(|| resolve_token(&args))
         .flatten()
         .and_then(|tok| update::Updater::new(&base_ws, tok, Duration::from_secs(30)));
     if let Some(u) = &updater {
@@ -253,10 +303,8 @@ async fn run_control(
     shells: &[String],
     updater: Option<&std::sync::Arc<update::Updater>>,
 ) -> anyhow::Result<()> {
-    let token = args
-        .token
-        .clone()
-        .ok_or_else(|| anyhow::anyhow!("no agent token configured (--token / RUSTLITEL_AGENT_TOKEN)"))?;
+    let token = resolve_token(args)
+        .ok_or_else(|| anyhow::anyhow!("no agent token configured (--token / --token-file / RUSTLITEL_AGENT_TOKEN)"))?;
 
     let url = format!("{base_ws}/ws/agent/control");
     let (ws, _) = tokio_tungstenite::connect_async(&url).await?;
@@ -326,6 +374,12 @@ fn dispatch(
             let _ = ctl_tx.send(reply(&AgentToServer::Pong));
         }
         ServerToAgent::Uninstall => {
+            // Remote uninstall is remote control: an agent that opted out of
+            // remote access must not be remotely self-deleted.
+            if !args.allow_remote {
+                tracing::warn!("ignoring remote uninstall: remote access is not enabled");
+                return;
+            }
             tracing::warn!("uninstall requested by operator — removing self");
             tokio::spawn(async move {
                 // Give in-flight control frames a moment to flush, then kick off
@@ -430,6 +484,39 @@ async fn confirm_prompt(session: &uuid::Uuid) -> bool {
 
 fn reply(msg: &AgentToServer) -> Message {
     Message::Text(serde_json::to_string(msg).unwrap())
+}
+
+/// The enrollment token, from `--token`/env or, preferred for the service, the
+/// `--token-file` (so the secret is never on the command line / registry).
+fn resolve_token(args: &RunArgs) -> Option<String> {
+    if let Some(t) = args.token.as_ref().filter(|t| !t.is_empty()) {
+        return Some(t.clone());
+    }
+    let path = args.token_file.as_ref()?;
+    match std::fs::read_to_string(path) {
+        Ok(s) => {
+            let t = s.trim().to_string();
+            (!t.is_empty()).then_some(t)
+        }
+        Err(e) => {
+            tracing::error!("cannot read token file {}: {e}", path.display());
+            None
+        }
+    }
+}
+
+/// Allow `wss://` to any host; allow `ws://` only to a loopback relay (dev), so
+/// the token never crosses a cleartext link to a remote relay.
+fn relay_scheme_ok(base_ws: &str) -> bool {
+    if base_ws.starts_with("wss://") {
+        return true;
+    }
+    if let Some(rest) = base_ws.strip_prefix("ws://") {
+        return rest.starts_with("localhost")
+            || rest.starts_with("127.0.0.1")
+            || rest.starts_with("[::1]");
+    }
+    false
 }
 
 fn default_shells() -> Vec<String> {

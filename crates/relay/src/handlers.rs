@@ -125,12 +125,41 @@ pub async fn oidc_login(
         return (StatusCode::NOT_FOUND, "OIDC is not enabled").into_response();
     };
     match oidc.begin_login(q.rd.as_deref().unwrap_or("/")).await {
-        Ok(url) => Redirect::to(&url).into_response(),
+        Ok((url, login_cookie)) => {
+            let mut resp = Redirect::to(&url).into_response();
+            resp.headers_mut().insert(
+                header::SET_COOKIE,
+                login_cookie_header(&login_cookie, state.auth.cookie_secure)
+                    .parse()
+                    .unwrap(),
+            );
+            resp
+        }
         Err(e) => {
             tracing::warn!("oidc begin_login: {e:#}");
             (StatusCode::BAD_GATEWAY, "could not reach the identity provider").into_response()
         }
     }
+}
+
+/// `Set-Cookie` for the short-lived signed login-state cookie. `SameSite=Lax`
+/// (not Strict) so it survives the top-level cross-site redirect back from
+/// Keycloak to `/oauth2/callback`.
+fn login_cookie_header(value: &str, secure: bool) -> String {
+    let secure = if secure { "; Secure" } else { "" };
+    format!(
+        "{}={value}; HttpOnly; SameSite=Lax; Path=/; Max-Age={}{secure}",
+        crate::oidc::LOGIN_COOKIE,
+        crate::oidc::LOGIN_TTL_SECS
+    )
+}
+
+fn clear_login_cookie_header(secure: bool) -> String {
+    let secure = if secure { "; Secure" } else { "" };
+    format!(
+        "{}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0{secure}",
+        crate::oidc::LOGIN_COOKIE
+    )
 }
 
 #[derive(Deserialize)]
@@ -146,31 +175,51 @@ pub struct OidcCallbackQuery {
 /// Keycloak redirect target: verify the login and establish a session.
 pub async fn oidc_callback(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Query(q): Query<OidcCallbackQuery>,
 ) -> Response {
     let Some(oidc) = state.oidc.as_ref() else {
         return (StatusCode::NOT_FOUND, "OIDC is not enabled").into_response();
     };
     if let Some(err) = q.error {
-        return (StatusCode::UNAUTHORIZED, format!("Keycloak returned: {err}")).into_response();
+        tracing::warn!("oidc callback error from idp: {err}");
+        return (StatusCode::UNAUTHORIZED, "login failed at the identity provider").into_response();
     }
     let (Some(code), Some(csrf)) = (q.code, q.state) else {
         return (StatusCode::BAD_REQUEST, "missing code or state").into_response();
     };
-    match oidc.complete_login(&code, &csrf).await {
+    let login_cookie = crate::auth::cookie_value(cookie_str(&headers), crate::oidc::LOGIN_COOKIE);
+    match oidc
+        .complete_login(&code, &csrf, login_cookie.as_deref())
+        .await
+    {
         Ok((identity, return_to)) => {
             tracing::info!(user = %identity.username, "oidc login");
             let id = state.auth.issue(Some(identity.username));
             let mut resp = Redirect::to(&return_to).into_response();
-            resp.headers_mut().insert(
+            resp.headers_mut().append(
                 header::SET_COOKIE,
                 state.auth.cookie_header(&id).parse().unwrap(),
+            );
+            resp.headers_mut().append(
+                header::SET_COOKIE,
+                clear_login_cookie_header(state.auth.cookie_secure)
+                    .parse()
+                    .unwrap(),
             );
             resp
         }
         Err(e) => {
+            // Detail server-side only; a generic message to the browser.
             tracing::warn!("oidc login failed: {e:#}");
-            (StatusCode::UNAUTHORIZED, format!("login failed: {e}")).into_response()
+            let mut resp = (StatusCode::UNAUTHORIZED, "login failed — please try again").into_response();
+            resp.headers_mut().insert(
+                header::SET_COOKIE,
+                clear_login_cookie_header(state.auth.cookie_secure)
+                    .parse()
+                    .unwrap(),
+            );
+            resp
         }
     }
 }
@@ -239,12 +288,25 @@ async fn api_authed(state: &AppState, headers: &HeaderMap) -> bool {
 
 fn origin_ok(state: &AppState, headers: &HeaderMap) -> bool {
     let Some(expected) = state.public_origin.as_deref() else {
-        return true; // not configured -> skip (local dev)
+        return true; // not configured -> skip (local dev; prod refuses to start unset)
     };
     match headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
         Some(o) => o == expected,
         None => false,
     }
+}
+
+/// CSRF guard for cookie-authenticated, state-changing JSON endpoints. A request
+/// carrying our session cookie is browser-driven, so its `Origin` must match;
+/// a Bearer-only request (script/CLI, no cookie) is not CSRF-able and carries
+/// no `Origin`, so it is allowed through. `SameSite=Strict` already blocks the
+/// cross-site case — this additionally closes the same-site (sibling subdomain
+/// / XSS) residual.
+fn csrf_ok(state: &AppState, headers: &HeaderMap) -> bool {
+    if session_from_cookies(cookie_str(headers)).is_none() {
+        return true; // no cookie -> not a browser/CSRF vector
+    }
+    origin_ok(state, headers)
 }
 
 // ---------------------------------------------------------------------------
@@ -295,6 +357,9 @@ pub async fn exec(
 ) -> Response {
     if !api_authed(&state, &headers).await {
         return StatusCode::UNAUTHORIZED.into_response();
+    }
+    if !csrf_ok(&state, &headers) {
+        return StatusCode::FORBIDDEN.into_response();
     }
 
     let commands = {
@@ -393,9 +458,22 @@ pub async fn uninstall_agent(
     if !api_authed(&state, &headers).await {
         return StatusCode::UNAUTHORIZED.into_response();
     }
+    if !csrf_ok(&state, &headers) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
     let commands = {
         let agents = state.agents.lock().await;
         match agents.get(&req.agent) {
+            // Remote uninstall is a remote control action: honour the same
+            // `--allow-remote` gate the exec/terminal paths use, so an agent
+            // started without remote access can't be remotely self-deleted.
+            Some(c) if !c.allow_remote => {
+                return (
+                    StatusCode::FORBIDDEN,
+                    "agent has remote access disabled (started without --allow-remote)",
+                )
+                    .into_response();
+            }
             Some(c) => c.commands.clone(),
             None => return (StatusCode::NOT_FOUND, "agent not connected").into_response(),
         }
@@ -469,6 +547,9 @@ pub async fn make_installer(
 ) -> Response {
     if !api_authed(&state, &headers).await {
         return StatusCode::UNAUTHORIZED.into_response();
+    }
+    if !csrf_ok(&state, &headers) {
+        return StatusCode::FORBIDDEN.into_response();
     }
     let os = req.os.as_deref().unwrap_or("windows");
     let Some((base_file, _)) = installer_bases(os) else {
@@ -599,7 +680,7 @@ async fn serve_baked(
 /// Public config the `wrs` CLI fetches to start its Keycloak device-flow login.
 pub async fn auth_config(State(state): State<Arc<AppState>>) -> Response {
     match state.oidc.as_ref() {
-        Some(oidc) => Json(oidc.public_config(&state.oidc_cli_client_id)).into_response(),
+        Some(oidc) => Json(oidc.public_config()).into_response(),
         None => Json(serde_json::json!({ "issuer": null })).into_response(),
     }
 }
@@ -627,14 +708,31 @@ pub struct AgentUpdateQuery {
 #[derive(Serialize)]
 struct UpdateManifest {
     version: String,
+    build_epoch: u64,
     sha256: String,
     size: u64,
+    /// Base64 ed25519 signature over `proto::update_signing_message(...)`,
+    /// produced OFFLINE by the release signer (the relay cannot mint it). An
+    /// agent with a baked public key refuses to update when this is absent.
+    sig: Option<String>,
 }
 
-/// What build the relay is serving for `os`. `version` is the relay's own build
-/// id; an agent compares it to its baked [`rustlitel_proto::BUILD_ID`] and, when they
-/// differ, pulls `GET /api/agent/binary` — whose exact bytes `sha256`/`size`
-/// describe, so the agent can verify the download before swapping.
+/// A signed update sidecar produced offline next to a stock agent binary
+/// (`<binary>.sig.json`). The relay serves its fields verbatim; it never signs.
+#[derive(Deserialize)]
+struct UpdateSidecar {
+    version: String,
+    build_epoch: u64,
+    sha256: String,
+    size: u64,
+    sig: String,
+}
+
+/// What build the relay is serving for `os`. When a signed sidecar is present
+/// its fields (version, epoch, sha256, size, signature) are served verbatim so
+/// the agent can verify the download's signature + hash before swapping. With
+/// no sidecar the relay reports an unsigned manifest (no `sig`); a correctly
+/// configured agent then refuses to self-update (fail closed).
 pub async fn agent_update(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -646,15 +744,36 @@ pub async fn agent_update(
     let Some((base_file, _)) = installer_bases(&q.os) else {
         return (StatusCode::BAD_REQUEST, "unknown os").into_response();
     };
-    let path = std::path::Path::new(&state.agents_dir).join(base_file);
-    let bytes = match tokio::fs::read(&path).await {
+    let dir = std::path::Path::new(&state.agents_dir);
+
+    // Prefer the signed sidecar — serving its fields verbatim means the agent
+    // verifies a signature the relay could not have forged.
+    let sidecar_path = dir.join(format!("{base_file}.sig.json"));
+    if let Ok(txt) = tokio::fs::read(&sidecar_path).await {
+        if let Ok(sc) = serde_json::from_slice::<UpdateSidecar>(&txt) {
+            return Json(UpdateManifest {
+                version: sc.version,
+                build_epoch: sc.build_epoch,
+                sha256: sc.sha256,
+                size: sc.size,
+                sig: Some(sc.sig),
+            })
+            .into_response();
+        }
+        tracing::warn!("update sidecar {} is malformed; serving unsigned", sidecar_path.display());
+    }
+
+    // No sidecar: unsigned manifest (agents with a baked key will decline).
+    let bytes = match tokio::fs::read(dir.join(base_file)).await {
         Ok(b) => b,
         Err(_) => return (StatusCode::NOT_FOUND, "binary not available").into_response(),
     };
     Json(UpdateManifest {
         version: rustlitel_proto::BUILD_ID.to_string(),
+        build_epoch: rustlitel_proto::build_epoch(),
         sha256: sha256_hex(&bytes),
         size: bytes.len() as u64,
+        sig: None,
     })
     .into_response()
 }
@@ -740,9 +859,19 @@ pub async fn term_ws(
     if !origin_ok(&state, &headers) {
         return StatusCode::FORBIDDEN.into_response();
     }
-    // Short-circuit a nicer 404 if the agent is plainly not here.
-    if !state.agents.lock().await.contains_key(&q.agent) {
-        return (StatusCode::NOT_FOUND, "agent not connected").into_response();
+    // The interactive terminal is remote control: honour `--allow-remote` here
+    // too (the exec path already does), so a listed-but-inert agent can't be
+    // driven via the PTY.
+    match state.agents.lock().await.get(&q.agent) {
+        None => return (StatusCode::NOT_FOUND, "agent not connected").into_response(),
+        Some(c) if !c.allow_remote => {
+            return (
+                StatusCode::FORBIDDEN,
+                "agent has remote access disabled (started without --allow-remote)",
+            )
+                .into_response();
+        }
+        Some(_) => {}
     }
     let cols = q.cols.unwrap_or(80).clamp(1, 1000);
     let rows = q.rows.unwrap_or(24).clamp(1, 1000);
@@ -909,6 +1038,21 @@ async fn handle_agent_control(socket: WebSocket, state: Arc<AppState>) {
 
     {
         let mut agents = state.agents.lock().await;
+        // Refuse to take over an id that is already connected. A join key is not
+        // bound to a specific agent_id, so silently replacing a live entry would
+        // let any key holder impersonate an existing agent and MITM operator
+        // sessions. A genuine reconnect succeeds once the stale entry is evicted
+        // (when its control link drops / its heartbeat fails).
+        if agents.contains_key(&agent_id) {
+            tracing::warn!(agent_id = %agent_id, "rejecting registration: id already connected");
+            return;
+        }
+        // Cap concurrent agents so a flood of valid-keyed connections can't
+        // exhaust memory.
+        if agents.len() >= state.max_agents {
+            tracing::warn!(agent_id = %agent_id, max = state.max_agents, "rejecting registration: agent limit reached");
+            return;
+        }
         agents.insert(
             agent_id.clone(),
             AgentConn {

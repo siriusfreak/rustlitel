@@ -110,10 +110,15 @@ impl Auth {
 
 /// Extract the `rustlitel_session` value from a `Cookie` header, if present.
 pub fn session_from_cookies(cookie_header: Option<&str>) -> Option<String> {
+    cookie_value(cookie_header, COOKIE_NAME)
+}
+
+/// Extract a named cookie's value from a `Cookie` header, if present.
+pub fn cookie_value(cookie_header: Option<&str>, name: &str) -> Option<String> {
     let header = cookie_header?;
     for part in header.split(';') {
         let part = part.trim();
-        if let Some(rest) = part.strip_prefix(COOKIE_NAME) {
+        if let Some(rest) = part.strip_prefix(name) {
             if let Some(val) = rest.strip_prefix('=') {
                 return Some(val.to_string());
             }

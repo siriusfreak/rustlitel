@@ -32,7 +32,15 @@ pub async fn serve(State(state): State<Arc<AppState>>, uri: Uri) -> Response {
 
 async fn read_file(dir: &str, rel: &str) -> Option<Response> {
     let path = std::path::Path::new(dir).join(rel);
-    let bytes = tokio::fs::read(&path).await.ok()?;
+    // Confine to the bundle dir: resolve symlinks/`..` and require the result to
+    // stay under the (canonicalised) UI dir, so a traversal or an escaping
+    // symlink can never read files outside the bundle.
+    let base = tokio::fs::canonicalize(dir).await.ok()?;
+    let real = tokio::fs::canonicalize(&path).await.ok()?;
+    if !real.starts_with(&base) {
+        return None;
+    }
+    let bytes = tokio::fs::read(&real).await.ok()?;
     Some(([(header::CONTENT_TYPE, content_type(rel))], bytes).into_response())
 }
 

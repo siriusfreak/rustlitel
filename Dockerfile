@@ -19,6 +19,14 @@ WORKDIR /src
 # no .git, hence the explicit arg.
 ARG RUSTLITEL_BUILD_ID=docker
 ENV RUSTLITEL_BUILD_ID=${RUSTLITEL_BUILD_ID}
+# Monotonic build epoch (strict-newer self-update guard) and the ed25519 public
+# key the agent verifies a self-update signature against. The build context has
+# no .git, so these are passed explicitly from `make image`. An empty pubkey
+# leaves self-update disabled (fail closed) until signing is configured.
+ARG RUSTLITEL_BUILD_EPOCH=0
+ENV RUSTLITEL_BUILD_EPOCH=${RUSTLITEL_BUILD_EPOCH}
+ARG RUSTLITEL_UPDATE_PUBKEY=
+ENV RUSTLITEL_UPDATE_PUBKEY=${RUSTLITEL_UPDATE_PUBKEY}
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 # Cache the cargo registry and target dir across builds so an incremental change

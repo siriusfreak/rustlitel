@@ -41,6 +41,7 @@ pub async fn run(
     }
 
     let mut cmd = build_command(allowed_shells, requested_shell.as_deref(), &command);
+    scrub_env(&mut cmd);
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -204,4 +205,18 @@ fn powershell(prog: &str, command: &str) -> Command {
     let mut c = Command::new(prog);
     c.args(["-NoProfile", "-NonInteractive", "-Command", command]);
     c
+}
+
+/// Keep the agent's own configuration out of the child's environment, so a
+/// command run on behalf of an operator can't read the enrollment token (or
+/// where it is) out of `env` on an env-configured agent.
+fn scrub_env(cmd: &mut Command) {
+    for k in [
+        "RUSTLITEL_AGENT_TOKEN",
+        "RUSTLITEL_AGENT_TOKEN_FILE",
+        "RUSTLITEL_RELAY",
+        "RUSTLITEL_LOG",
+    ] {
+        cmd.env_remove(k);
+    }
 }

@@ -139,8 +139,8 @@ pub struct AppState {
     pub short_links: Mutex<HashMap<String, ShortLink>>,
     /// How long a short installer link stays valid.
     pub short_link_ttl: std::time::Duration,
-    /// Public Keycloak client id the `wrs` CLI uses for its device-flow login.
-    pub oidc_cli_client_id: String,
+    /// Maximum number of concurrently registered agents (DoS cap).
+    pub max_agents: usize,
 }
 
 impl AppState {
