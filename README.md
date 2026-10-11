@@ -9,18 +9,20 @@ browser (or an HTTP client) talks to the relay; the relay bridges the two.
 Nothing listens for inbound connections on the target side.
 
 ```
-   browser ─────wss───►┌───────────────┐◄────wss──── agent (behind NAT)
-   xterm.js            │     relay      │             PTY (ConPTY / openpty)
-   POST /api/exec ────►│  auth + bridge │             child proc → exec
-   wrs CLI / Bearer    └───────────────┘             dials OUT only
+   browser (egui/WASM) ─wss─►┌───────────────┐◄─wss─ agent (behind NAT)
+   POST /api/exec ──────────►│     relay     │       PTY (ConPTY / openpty)
+   rustlitel CLI / Bearer ──►│ auth + bridge │       child proc → exec
+                             └───────────────┘       dials OUT only
 ```
 
 Ways to use it:
 
-* **Interactive terminal** in the browser (xterm.js) — for a human.
+* **Interactive terminal** in the browser (egui/WASM) — for a human.
 * **`rustlitel` CLI** — `login` (Keycloak device flow), `agents`, `exec`.
 * **`POST /api/exec`** — one command in, `stdout`/`stderr`/exit code out. The
   primitive a script or an LLM session uses to inspect and fix the machine.
+
+![The rustlitel operator console — agent list, a live in-browser terminal, and a dark / light / system theme.](docs/console.jpg)
 
 ---
 
@@ -164,6 +166,8 @@ rustlitel-agent --relay ws://127.0.0.1:8099 --token <AGENT_TOKEN> --allow-remote
 
 Sign in → pick an agent (green dot = remote enabled) → choose a shell → a session
 opens once the agent accepts it.
+
+![Sign-in — operator token, or Keycloak SSO when configured.](docs/login.jpg)
 
 ### Exec API (scripts / your own session)
 
