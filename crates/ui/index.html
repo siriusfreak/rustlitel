@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
+    <title>rustlitel</title>
+    <link data-trunk rel="rust" data-bin="rustlitel-ui" data-wasm-opt="2" />
+    <style>
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        overflow: hidden;
+      }
+      canvas {
+        width: 100%;
+        height: 100%;
+        display: block;
+      }
+      /* First-paint background; egui paints over it once the wasm loads. */
+      body {
+        background: #0e0f13;
+      }
+      @media (prefers-color-scheme: light) {
+        body {
+          background: #f3f4f6;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <canvas id="canvas"></canvas>
+  </body>
+</html>

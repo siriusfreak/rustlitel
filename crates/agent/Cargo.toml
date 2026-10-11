@@ -1,0 +1,48 @@
+[package]
+name = "rustlitel-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "rustlitel-agent"
+path = "src/main.rs"
+
+[dependencies]
+rustlitel-proto = { path = "../proto" }
+tokio = { workspace = true }
+tokio-tungstenite = { version = "0.23", features = ["rustls-tls-webpki-roots"] }
+futures-util = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { version = "4", features = ["derive", "env"] }
+portable-pty = "0.8"
+gethostname = "0.5"
+# rustls 0.23 needs a crypto provider explicitly installed; pick ring (builds
+# cleanly on Windows msvc/gnu). Must match the rustls tokio-tungstenite pulls.
+rustls = { version = "0.23", features = ["ring"] }
+# Self-update downloads the fresh binary over HTTPS. Use the `-no-provider`
+# rustls feature so reqwest reuses the process-global ring provider we install
+# in main() (no aws-lc-rs — that cross-compiles badly to the Windows/macOS
+# agent targets, whereas ring already builds for them via tokio-tungstenite).
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls-webpki-roots-no-provider",
+] }
+sha2 = "0.10"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.7"
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }

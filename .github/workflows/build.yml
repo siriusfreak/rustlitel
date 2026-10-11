@@ -1,0 +1,40 @@
+name: build
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  windows-agent:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build agent (MSVC)
+        run: cargo build --release -p rustlitel-agent
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rustlitel-agent-windows-x64
+          path: target/release/rustlitel-agent.exe
+
+  relay-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build relay
+        run: cargo build --release -p rustlitel-relay
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rustlitel-relay-linux-x64
+          path: target/release/rustlitel-relay
+
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Test
+        run: cargo test --workspace

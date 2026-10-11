@@ -1,0 +1,7 @@
+/target
+/dist
+/crates/ui/dist
+/Makefile.local
+**/*.rs.bk
+*.pdb
+.DS_Store

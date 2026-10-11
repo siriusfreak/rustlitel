@@ -1,0 +1,32 @@
+[package]
+name = "rustlitel-relay"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "rustlitel-relay"
+path = "src/main.rs"
+
+[dependencies]
+rustlitel-proto = { path = "../proto" }
+tokio = { workspace = true }
+axum = { version = "0.7", features = ["ws"] }
+tower = "0.5"
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+futures-util = { workspace = true }
+subtle = "2"
+rand = "0.8"
+hmac = "0.12"
+sha2 = "0.10"
+base64 = "0.22"
+# OIDC (Keycloak) operator login: HTTP to the IdP + RS256 ID-token verification.
+# reqwest's rustls-tls brings its own aws-lc-rs provider, so no manual provider.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+jsonwebtoken = "9"
+url = "2"
