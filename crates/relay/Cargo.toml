@@ -28,5 +28,5 @@ base64 = "0.22"
 # OIDC (Keycloak) operator login: HTTP to the IdP + RS256 ID-token verification.
 # reqwest's rustls-tls brings its own aws-lc-rs provider, so no manual provider.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-jsonwebtoken = "9"
+jsonwebtoken = "11"
 url = "2"
