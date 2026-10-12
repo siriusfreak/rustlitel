@@ -18,6 +18,6 @@ anyhow = { workspace = true }
 clap = { version = "4", features = ["derive", "env"] }
 ring = "0.17"
 base64 = "0.22"
-sha2 = "0.10"
+sha2 = "0.11"
 serde = { workspace = true }
 serde_json = { workspace = true }
