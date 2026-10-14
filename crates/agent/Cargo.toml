@@ -20,7 +20,7 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 clap = { version = "4", features = ["derive", "env"] }
-portable-pty = "0.8"
+portable-pty = "0.9"
 gethostname = "0.5"
 # rustls 0.23 needs a crypto provider explicitly installed; pick ring (builds
 # cleanly on Windows msvc/gnu). Must match the rustls tokio-tungstenite pulls.
