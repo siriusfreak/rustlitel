@@ -41,7 +41,47 @@ async fn read_file(dir: &str, rel: &str) -> Option<Response> {
         return None;
     }
     let bytes = tokio::fs::read(&real).await.ok()?;
-    Some(([(header::CONTENT_TYPE, content_type(rel))], bytes).into_response())
+    Some(
+        (
+            [
+                (header::CONTENT_TYPE, content_type(rel)),
+                (header::CACHE_CONTROL, cache_control(rel)),
+            ],
+            bytes,
+        )
+            .into_response(),
+    )
+}
+
+/// Caching policy. `index.html` must always be revalidated so a deploy's new
+/// content-hashed asset names are picked up (otherwise a stale index points at
+/// an evicted .wasm and the app fails to load). Trunk's hashed assets are
+/// immutable and can be cached forever. Anything else revalidates to be safe.
+fn cache_control(rel: &str) -> &'static str {
+    if rel == "index.html" {
+        "no-cache"
+    } else if is_content_hashed(rel) {
+        "public, max-age=31536000, immutable"
+    } else {
+        "no-cache"
+    }
+}
+
+/// True when the filename carries a Trunk content hash (a run of >=16 hex chars,
+/// e.g. `rustlitel-ui-564908b63a531906.js`), so it is safe to cache forever.
+fn is_content_hashed(name: &str) -> bool {
+    let mut run = 0u32;
+    for c in name.chars() {
+        if c.is_ascii_hexdigit() {
+            run += 1;
+            if run >= 16 {
+                return true;
+            }
+        } else {
+            run = 0;
+        }
+    }
+    false
 }
 
 fn content_type(path: &str) -> &'static str {
