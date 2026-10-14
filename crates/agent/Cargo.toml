@@ -32,7 +32,7 @@ rustls = { version = "0.23", features = ["ring"] }
 reqwest = { version = "0.12", default-features = false, features = [
     "rustls-tls-webpki-roots-no-provider",
 ] }
-sha2 = "0.10"
+sha2 = "0.11"
 # Verify the ed25519 signature on a self-update. ring is already in the tree via
 # rustls, so this adds no new dependency; it builds for every agent target.
 ring = "0.17"

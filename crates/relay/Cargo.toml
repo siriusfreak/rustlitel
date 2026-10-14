@@ -23,7 +23,7 @@ futures-util = { workspace = true }
 subtle = "2"
 rand = "0.8"
 hmac = "0.12"
-sha2 = "0.10"
+sha2 = "0.11"
 base64 = "0.22"
 # OIDC (Keycloak) operator login: HTTP to the IdP + RS256 ID-token verification.
 # reqwest's rustls-tls brings its own aws-lc-rs provider, so no manual provider.
