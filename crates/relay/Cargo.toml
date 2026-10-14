@@ -28,5 +28,9 @@ base64 = "0.22"
 # OIDC (Keycloak) operator login: HTTP to the IdP + RS256 ID-token verification.
 # reqwest's rustls-tls brings its own aws-lc-rs provider, so no manual provider.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-jsonwebtoken = "11"
+# jsonwebtoken 11's default features enable NO crypto backend, so RS256 verify
+# panics at runtime ("determine the process-level CryptoProvider"). Pin the
+# aws-lc-rs backend — already in the tree via reqwest/rustls, and (unlike
+# rust_crypto) it pulls no `rsa` crate, so `cargo audit` stays clean.
+jsonwebtoken = { version = "11", features = ["aws_lc_rs"] }
 url = "2"
