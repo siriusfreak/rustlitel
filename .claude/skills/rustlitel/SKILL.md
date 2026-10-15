@@ -79,3 +79,8 @@ UI at `https://<host>` — it has an in-browser terminal with selection/copy.
   confirmation. If you lock out the agent, there is no second channel in.
 - Default to read-only diagnostics first; show what you found and the fix you
   propose before applying it, unless the user has said to just fix it.
+
+## Related
+
+- Cleaning up / de-bloating a Windows machine (disk, apps, Appx, telemetry,
+  services, visual effects): the `windows-cleanup` skill next to this one.
