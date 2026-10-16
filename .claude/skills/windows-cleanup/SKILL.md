@@ -71,6 +71,18 @@ Do not disable, even when a "debloat" list says so:
   WMI filter? Use `$q=[char]39` or a backtick-escaped double quote
   (`-Filter "Name=`"WerSvc`""`). For `Start-Process -ArgumentList` pass an
   array: `@("-L","-o","C:\x.iso","https://…")`.
+- **Anything longer than a one-liner: ship it as base64.** Write the script to a
+  local `.ps1` (any quotes you like), then
+  `rustlitel exec <agent> "[Console]::OutputEncoding=[Text.Encoding]::UTF8; Invoke-Expression ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$(base64 -i x.ps1 | tr -d '\n')')))"`.
+  No quoting layer left to break. For long jobs, write the decoded script to
+  `C:\ProgramData\cleanup\job.ps1`, start it detached with
+  `Start-Process powershell.exe -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File',…`
+  and have it log to a file you poll.
+- **Polls must be short.** An `exec` that loops for minutes can be cut by the
+  network while the agent keeps running it, and the agent serves one command
+  at a time — every following `exec` then fails with "timed out waiting for
+  the agent" until the loop ends. Poll with many ~30 s `exec`s from a local
+  loop instead of one long one.
 - **HKCU is SYSTEM's hive.** Per-user settings go to
   `HKU:\<SID>\…` (map it: `New-PSDrive -Name HKU -PSProvider Registry -Root HKEY_USERS`).
   Get the SID from `Win32_UserProfile` (non-special). Per-user installs (uTorrent,
@@ -82,6 +94,17 @@ Do not disable, even when a "debloat" list says so:
   "HKU\u_tmp"`. Don't load it while the user is logged on (it is already at
   `HKU\<SID>`). `New-Item` under a missing `HKU:\<SID>` fails with "The
   parameter is incorrect".
+- **InstallScript MSIs ignore `/qn`.** `msiexec /x {GUID} /qn` for
+  InstallShield-built packages (Caterpillar SIS: "Uninstall License Warning")
+  still raises a dialog from `ISBEW64.exe` and waits forever. Watch the MSI
+  log (`/l*v`) — if it stops growing at a `setup.rul … Begin` line, kill
+  `msiexec`/`ISBEW64` and remove that product by hand (folders, services,
+  Uninstall key, `Installer\Products\<packed GUID>`).
+- **Before a big removal, checkpoint the VM** on its Hyper-V host
+  (`Checkpoint-VM -Name <vm> -SnapshotName before-cleanup-<date>`) and check
+  free space on the host volume: while the checkpoint exists every guest write
+  grows the `.avhdx`, and a full volume pauses *every* VM on it. Delete the
+  checkpoint once the user confirms the machine works.
 - **Uninstallers hang in session 0.** Inno Setup / NSIS uninstallers that pop a
   dialog (AOMEI feedback window, Revo prompts) wait forever on an invisible
   window, even with `/VERYSILENT /SUPPRESSMSGBOXES`. Always `WaitForExit(timeout)`.
