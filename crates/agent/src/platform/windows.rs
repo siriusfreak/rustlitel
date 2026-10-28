@@ -326,6 +326,7 @@ fn remove() -> windows_service::Result<()> {
 /// Self-delete, driven by the operator's "uninstall" button. Spawns a detached
 /// cleanup process that outlives us: it stops + deletes the service (which ends
 /// this process) and then removes the installed copy. Returns immediately.
+/// The pauses are `ping`: `timeout` exits at once without a console.
 pub fn self_uninstall() {
     use std::os::windows::process::CommandExt;
     const DETACHED_PROCESS: u32 = 0x0000_0008;
@@ -333,8 +334,8 @@ pub fn self_uninstall() {
 
     let dir = install_dir();
     let script = format!(
-        "timeout /t 1 /nobreak >nul & sc stop {name} >nul 2>&1 & sc delete {name} >nul 2>&1 & \
-         timeout /t 2 /nobreak >nul & rmdir /s /q \"{dir}\"",
+        "ping -n 2 127.0.0.1 >nul & sc stop {name} >nul 2>&1 & sc delete {name} >nul 2>&1 & \
+         ping -n 4 127.0.0.1 >nul & rmdir /s /q \"{dir}\"",
         name = SERVICE_NAME,
         dir = dir.display()
     );
@@ -348,11 +349,20 @@ pub fn self_uninstall() {
 
 /// Swap the installed service binary for `new_bytes` and restart the service.
 ///
-/// The running `.exe` is locked, so we can't overwrite ourselves in place.
-/// Instead write the fresh binary beside us as `rustlitel-agent.new.exe`, then spawn a
-/// detached `cmd` (which outlives us) that stops the service — ending this
-/// process and freeing the lock — moves the new file over the old, and starts
-/// the service again, so the SCM relaunches the updated binary.
+/// Windows won't overwrite or delete a running image, but it does let one be
+/// renamed. So the swap happens here, while we still run: the fresh binary is
+/// written beside us as `rustlitel-agent.new.exe`, we move ourselves aside to
+/// `rustlitel-agent.old.exe` and the new file into our place. Only the restart
+/// needs a helper that outlives us: a detached PowerShell `Restart-Service`,
+/// which waits for the stop to finish before it starts the service again, now
+/// from the new binary. `rustlitel-agent.old.exe` stays until the next update,
+/// for a manual rollback.
+///
+/// The first version left the move to a `cmd` helper behind `timeout /t 3`.
+/// Without a console (a detached process has none) `timeout` exits at once, so
+/// the move ran while this process still held the file and failed, and the
+/// helper started the old binary again. That one found the update on connect
+/// and went round again, pulling the whole binary every ~9 s (2026-10-28).
 pub fn apply_update(new_bytes: &[u8]) -> anyhow::Result<()> {
     use std::os::windows::process::CommandExt;
     const DETACHED_PROCESS: u32 = 0x0000_0008;
@@ -361,25 +371,42 @@ pub fn apply_update(new_bytes: &[u8]) -> anyhow::Result<()> {
     let exe = std::env::current_exe().context("current_exe")?;
     let dir = exe.parent().context("exe has no parent dir")?;
     let staged = dir.join("rustlitel-agent.new.exe");
+    let old = dir.join("rustlitel-agent.old.exe");
     std::fs::write(&staged, new_bytes)
         .with_context(|| format!("stage update at {}", staged.display()))?;
 
-    // `timeout` spaces the steps out so the service has time to exit and release
-    // the binary before the move; `sc start` brings the new one up.
-    let script = format!(
-        "timeout /t 1 /nobreak >nul & sc stop {name} >nul 2>&1 & timeout /t 3 /nobreak >nul & \
-         move /y \"{staged}\" \"{target}\" >nul 2>&1 & sc start {name} >nul 2>&1",
-        name = SERVICE_NAME,
-        staged = staged.display(),
-        target = exe.display(),
-    );
-    std::process::Command::new("cmd")
-        .args(["/C", &script])
+    // The previous update's leftover; nothing runs from it any more.
+    let _ = std::fs::remove_file(&old);
+    retry_io(|| std::fs::rename(&exe, &old))
+        .with_context(|| format!("move {} aside", exe.display()))?;
+    if let Err(e) = retry_io(|| std::fs::rename(&staged, &exe)) {
+        let _ = std::fs::rename(&old, &exe);
+        return Err(e).with_context(|| format!("move {} into place", staged.display()));
+    }
+
+    let script = format!("Start-Sleep -Seconds 1; Restart-Service -Name {SERVICE_NAME} -Force");
+    std::process::Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
         .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
         .spawn()
-        .context("spawn update helper")?;
-    tracing::info!("self-update staged; service will restart on the new binary");
+        .context("spawn restart helper")?;
+    tracing::info!("self-update swapped in; service restarting on the new binary");
     Ok(())
+}
+
+/// Retry a file operation for up to 5 s: an antivirus keeps a freshly written
+/// executable open while it scans it.
+fn retry_io(mut op: impl FnMut() -> std::io::Result<()>) -> std::io::Result<()> {
+    let mut attempts = 0;
+    loop {
+        match op() {
+            Err(_) if attempts < 10 => {
+                attempts += 1;
+                std::thread::sleep(Duration::from_millis(500));
+            }
+            result => return result,
+        }
+    }
 }
 
 // --- service runtime -------------------------------------------------------

@@ -138,7 +138,10 @@ impl Updater {
         verify_hash(&bytes, &manifest)?;
 
         tracing::info!(size = bytes.len(), "self-update: verified, applying");
-        platform::apply_update(&bytes)?;
+        // The Windows swap sleeps between retries; keep it off the async workers.
+        tokio::task::spawn_blocking(move || platform::apply_update(&bytes))
+            .await
+            .context("self-update task")??;
         Ok(())
     }
 
