@@ -294,6 +294,14 @@ pub async fn serve(args: RunArgs) {
     }
 }
 
+/// How long the control link may stay silent before the agent drops it and
+/// reconnects. The relay pings every 30 s, so this is three missed pings.
+/// Without it an agent whose path died without a FIN or RST waits on the
+/// socket forever: it only ever answers the relay and writes nothing of its
+/// own, so TCP never notices. That is what a NAT flush does — e.g. the router
+/// losing its WAN lease for a second drops every masqueraded connection.
+const CONTROL_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
+
 /// Connect the control link, register, and service commands until it drops.
 async fn run_control(
     args: &RunArgs,
@@ -341,25 +349,35 @@ async fn run_control(
         }
     });
 
-    while let Some(msg) = ws_stream.next().await {
-        let msg = msg?;
-        match msg {
-            Message::Text(t) => {
-                let Ok(cmd) = serde_json::from_str::<ServerToAgent>(&t) else {
-                    continue;
-                };
-                dispatch(cmd, args, base_ws, shells, &ctl_tx);
+    let result: anyhow::Result<()> = async {
+        loop {
+            let msg = match tokio::time::timeout(CONTROL_IDLE_TIMEOUT, ws_stream.next()).await {
+                Ok(Some(msg)) => msg?,
+                Ok(None) => return Ok(()),
+                Err(_) => anyhow::bail!(
+                    "nothing from the relay for {}s, dropping the link",
+                    CONTROL_IDLE_TIMEOUT.as_secs()
+                ),
+            };
+            match msg {
+                Message::Text(t) => {
+                    let Ok(cmd) = serde_json::from_str::<ServerToAgent>(&t) else {
+                        continue;
+                    };
+                    dispatch(cmd, args, base_ws, shells, &ctl_tx);
+                }
+                Message::Ping(p) => {
+                    let _ = ctl_tx.send(Message::Pong(p));
+                }
+                Message::Close(_) => return Ok(()),
+                _ => {}
             }
-            Message::Ping(p) => {
-                let _ = ctl_tx.send(Message::Pong(p));
-            }
-            Message::Close(_) => break,
-            _ => {}
         }
     }
+    .await;
 
     writer.abort();
-    Ok(())
+    result
 }
 
 fn dispatch(
