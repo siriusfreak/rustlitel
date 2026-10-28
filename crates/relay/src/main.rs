@@ -50,6 +50,15 @@ async fn main() -> anyhow::Result<()> {
     let agents_dir = env_or("RUSTLITEL_AGENTS_DIR", "/srv/agents");
     let ui_dir = env_or("RUSTLITEL_UI_DIR", "/srv/ui");
     let short_link_ttl_days: u64 = env_or("RUSTLITEL_SHORT_LINK_TTL_DAYS", "7").parse().unwrap_or(7);
+    // SHA-256 of each join key to refuse, comma- or space-separated.
+    let revoked_keys: std::collections::HashSet<String> = env_or("RUSTLITEL_REVOKED_KEYS", "")
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_ascii_lowercase())
+        .collect();
+    if !revoked_keys.is_empty() {
+        tracing::info!(count = revoked_keys.len(), "revoked join keys loaded");
+    }
 
     if operator_token == agent_token {
         anyhow::bail!("RUSTLITEL_OPERATOR_TOKEN and RUSTLITEL_AGENT_TOKEN must differ");
@@ -101,6 +110,7 @@ async fn main() -> anyhow::Result<()> {
             cookie_secure,
         ),
         agent_token,
+        revoked_keys,
         public_origin: public_origin.clone(),
         open_timeout_secs,
         exec_output_cap,

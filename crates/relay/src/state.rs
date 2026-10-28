@@ -118,6 +118,9 @@ pub struct AppState {
     pub auth: Auth,
     /// Enrollment token every agent must present. Compared constant-time.
     pub agent_token: String,
+    /// Fingerprints ([`crate::installer::key_fingerprint`]) of join keys that are
+    /// signed and unexpired but must no longer be accepted.
+    pub revoked_keys: std::collections::HashSet<String>,
     /// Expected browser Origin for WS upgrades and login, or `None` to skip the
     /// check (local dev). e.g. `https://relay.example.com`.
     pub public_origin: Option<String>,

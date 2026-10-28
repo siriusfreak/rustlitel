@@ -576,7 +576,8 @@ pub async fn make_installer(
     }
 
     // The baked key is the installed agent's standing credential (used on every
-    // reconnect), so default it long-lived; revoke by rotating RUSTLITEL_AGENT_TOKEN.
+    // reconnect), so default it long-lived. Revoke one through
+    // RUSTLITEL_REVOKED_KEYS, all of them by rotating RUSTLITEL_AGENT_TOKEN.
     let ttl_days = req.ttl_days.unwrap_or(3650).clamp(1, 3650);
     let label = req.name.clone().unwrap_or_else(|| "installer".into());
     let join = crate::installer::mint_join_key(&state.agent_token, &label, ttl_days * 86400);
@@ -629,7 +630,7 @@ pub async fn download_installer(
     State(state): State<Arc<AppState>>,
     Query(q): Query<InstallerDownloadQuery>,
 ) -> Response {
-    if !crate::installer::validate_join_key(&state.agent_token, &q.key) {
+    if !join_key_ok(&state, &q.key) {
         return (StatusCode::FORBIDDEN, "invalid or expired installer link").into_response();
     }
     let os = q.os.as_deref().unwrap_or("windows");
@@ -704,7 +705,20 @@ fn agent_authed(state: &AppState, headers: &HeaderMap) -> bool {
         return false;
     };
     let master: bool = tok.as_bytes().ct_eq(state.agent_token.as_bytes()).into();
-    master || crate::installer::validate_join_key(&state.agent_token, tok)
+    master || join_key_ok(state, tok)
+}
+
+/// A join key the relay accepts: signed with the agent token, unexpired, and
+/// not listed in `RUSTLITEL_REVOKED_KEYS`.
+fn join_key_ok(state: &AppState, key: &str) -> bool {
+    if !crate::installer::validate_join_key(&state.agent_token, key) {
+        return false;
+    }
+    if state.revoked_keys.contains(&crate::installer::key_fingerprint(key)) {
+        tracing::warn!("revoked join key presented");
+        return false;
+    }
+    true
 }
 
 #[derive(Deserialize)]
@@ -1062,7 +1076,7 @@ async fn handle_agent_control(socket: WebSocket, state: Arc<AppState>) {
         .as_bytes()
         .ct_eq(state.agent_token.as_bytes())
         .into();
-    let token_ok = master_ok || crate::installer::validate_join_key(&state.agent_token, &hello.token);
+    let token_ok = master_ok || join_key_ok(&state, &hello.token);
     if !token_ok {
         tracing::warn!(agent_id = %hello.agent_id, "agent rejected: bad token");
         return;

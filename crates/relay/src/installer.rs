@@ -12,8 +12,10 @@
 //! The relay validates one by recomputing the HMAC (constant-time) and checking
 //! expiry. The signing secret is the master agent token, so no extra config is
 //! needed; rotating the agent token invalidates every outstanding join key
-//! (the coarse "revoke all" knob). An agent may present either the master agent
-//! token or a valid join key.
+//! (the coarse "revoke all" knob). A single key can't be withdrawn by deleting
+//! it, so the relay refuses the ones whose SHA-256 is listed in
+//! `RUSTLITEL_REVOKED_KEYS` ([`key_fingerprint`]). An agent may present either
+//! the master agent token or a valid join key.
 //!
 //! A **baked installer** is a stock agent binary with an [`InstallerConfig`]
 //! JSON trailer appended (`<json><MAGIC><u32 len>`), so running it needs no
@@ -89,6 +91,16 @@ pub fn validate_join_key(secret: &str, token: &str) -> bool {
     payload.exp > now()
 }
 
+/// Lowercase hex SHA-256 of a join key: how `RUSTLITEL_REVOKED_KEYS` names a
+/// key without holding the key itself.
+pub fn key_fingerprint(key: &str) -> String {
+    use sha2::Digest;
+    Sha256::digest(key.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
 /// Append an [`InstallerConfig`] trailer to a stock agent binary.
 pub fn bake(base: &[u8], cfg: &InstallerConfig) -> Vec<u8> {
     let json = serde_json::to_vec(cfg).expect("serialize config");
@@ -121,6 +133,17 @@ pub fn origin_to_ws(origin: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fingerprint_is_sha256_hex() {
+        assert_eq!(
+            key_fingerprint(""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        let k = mint_join_key("secret", "a", 60);
+        assert_eq!(key_fingerprint(&k), key_fingerprint(&k));
+        assert_ne!(key_fingerprint(&k), key_fingerprint(&mint_join_key("secret", "b", 60)));
+    }
 
     #[test]
     fn join_key_roundtrip() {
