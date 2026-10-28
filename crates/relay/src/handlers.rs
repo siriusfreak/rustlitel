@@ -35,6 +35,13 @@ use crate::state::{AgentConn, AppState, ExecEvent, Frame, Session, SessionSignal
 /// this only exists to reject something pathological.
 const MAX_FRAME: usize = 1 << 20;
 const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long an agent's control link may stay silent before the relay drops it.
+/// The writer pings every 30 s and every agent answers with a Pong, so this is
+/// three missed replies. Without it a link that died without a FIN or RST
+/// stays registered until TCP gives up on the pings (~15 min on Linux), and
+/// the agent's genuine reconnect is refused as "id already connected" the
+/// whole time. Mirrors the agent's own CONTROL_IDLE_TIMEOUT.
+const CONTROL_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 const CHANNEL_CAP: usize = 256;
 
 // ---------------------------------------------------------------------------
@@ -1009,14 +1016,43 @@ async fn handle_agent_control(socket: WebSocket, state: Arc<AppState>) {
     let (sink, mut stream) = socket.split();
 
     // First frame must be a valid, correctly-tokened Hello within the window.
+    // Every refusal is logged: a silent one leaves no trace of an agent that
+    // keeps trying, and that is exactly what an outage needs to tell apart.
     let hello: AgentHello = match tokio::time::timeout(HELLO_TIMEOUT, stream.next()).await {
         Ok(Some(Ok(Message::Text(t)))) => match serde_json::from_str(&t) {
             Ok(h) => h,
-            Err(_) => return,
+            Err(e) => {
+                tracing::warn!("agent rejected: hello is not valid JSON: {e}");
+                return;
+            }
         },
-        _ => return,
+        Ok(Some(Ok(_))) => {
+            tracing::warn!("agent rejected: first frame is not a text hello");
+            return;
+        }
+        Ok(Some(Err(e))) => {
+            tracing::warn!("agent link failed before hello: {e}");
+            return;
+        }
+        Ok(None) => {
+            tracing::warn!("agent link closed before hello");
+            return;
+        }
+        Err(_) => {
+            tracing::warn!(
+                "agent rejected: no hello within {}s",
+                HELLO_TIMEOUT.as_secs()
+            );
+            return;
+        }
     };
     if hello.protocol != PROTOCOL_VERSION {
+        tracing::warn!(
+            agent_id = %hello.agent_id,
+            got = ?hello.protocol,
+            want = ?PROTOCOL_VERSION,
+            "agent rejected: protocol version mismatch"
+        );
         return;
     }
     // Accept either the master agent token or a valid (signed, unexpired) join
@@ -1071,8 +1107,8 @@ async fn handle_agent_control(socket: WebSocket, state: Arc<AppState>) {
     // Writer: forward commands, heartbeat every 30s.
     let writer = tokio::spawn(control_writer(sink, cmd_rx));
 
-    // Reader: handle agent replies until the link drops.
-    control_reader(&mut stream, &state).await;
+    // Reader: handle agent replies until the link drops or goes silent.
+    control_reader(&mut stream, &state, &agent_id).await;
 
     writer.abort();
     // Only evict if we still own the registration (a reconnect may have won).
@@ -1107,8 +1143,24 @@ async fn control_writer(
     let _ = sink.close().await;
 }
 
-async fn control_reader(stream: &mut SplitStream<WebSocket>, state: &Arc<AppState>) {
-    while let Some(msg) = stream.next().await {
+async fn control_reader(
+    stream: &mut SplitStream<WebSocket>,
+    state: &Arc<AppState>,
+    agent_id: &str,
+) {
+    loop {
+        let msg = match tokio::time::timeout(CONTROL_IDLE_TIMEOUT, stream.next()).await {
+            Ok(Some(msg)) => msg,
+            Ok(None) => break,
+            Err(_) => {
+                tracing::warn!(
+                    agent_id = %agent_id,
+                    "agent link silent for {}s, dropping it",
+                    CONTROL_IDLE_TIMEOUT.as_secs()
+                );
+                break;
+            }
+        };
         let Ok(msg) = msg else { break };
         let text = match msg {
             Message::Text(t) => t,
