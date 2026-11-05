@@ -13,6 +13,8 @@ rustlitel-proto = { path = "../proto" }
 tokio = { workspace = true }
 axum = { version = "0.7", features = ["ws"] }
 tower = "0.5"
+# Binaries go out as a stream: read whole, one download is 16+ MB of a 128 MB pod.
+tokio-util = { version = "0.7", features = ["io"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }

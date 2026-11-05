@@ -39,6 +39,8 @@ help:
 	@echo "  ui               build the egui/WASM UI bundle (needs trunk + wasm target)"
 	@echo "  image            build + push the relay image to the private registry"
 	@echo "  agent-windows    cross-build the Windows agent .exe (needs the target + linker)"
+	@echo "  agent-macos      universal macOS agent into dist/ (macOS host, both targets)"
+	@echo "  cli-macos        universal macOS CLI into dist/ (macOS host, both targets)"
 	@echo "  update-keygen    generate the ed25519 self-update signing key (one-time)"
 	@echo "  sign-agents      ed25519-sign the dist/ agent binaries for self-update"
 	@echo "  run-relay        run the relay locally (needs RUSTLITEL_OPERATOR_TOKEN, RUSTLITEL_AGENT_TOKEN)"
@@ -91,6 +93,33 @@ agent-windows:
 	RUSTLITEL_UPDATE_PUBKEY=$(UPDATE_PUBKEY) \
 	  $(CARGO) build --release -p rustlitel-agent --target x86_64-pc-windows-gnu
 	@echo "-> target/x86_64-pc-windows-gnu/release/rustlitel-agent.exe"
+
+# macOS binaries: one universal file for Apple Silicon and Intel, built on a Mac:
+#   rustup target add aarch64-apple-darwin x86_64-apple-darwin
+# Ad-hoc signed, which arm64 requires. The relay appends an installer trailer after the last slice; the
+# kernel does not read past it. Self-update needs `make sign-agents` as well.
+MACOS_TARGETS := aarch64-apple-darwin x86_64-apple-darwin
+
+.PHONY: agent-macos
+agent-macos:
+	for t in $(MACOS_TARGETS); do \
+	  RUSTLITEL_BUILD_ID=$(BUILD_ID) RUSTLITEL_BUILD_EPOCH=$(BUILD_EPOCH) RUSTLITEL_UPDATE_PUBKEY=$(UPDATE_PUBKEY) \
+	    $(CARGO) build --release -p rustlitel-agent --target $$t || exit 1; \
+	done
+	mkdir -p dist
+	lipo -create -output dist/rustlitel-agent-macos $(MACOS_TARGETS:%=target/%/release/rustlitel-agent)
+	codesign --force --sign - dist/rustlitel-agent-macos
+	@echo "-> dist/rustlitel-agent-macos"
+
+.PHONY: cli-macos
+cli-macos:
+	for t in $(MACOS_TARGETS); do \
+	  $(CARGO) build --release -p rustlitel-cli --target $$t || exit 1; \
+	done
+	mkdir -p dist
+	lipo -create -output dist/rustlitel-cli-macos $(MACOS_TARGETS:%=target/%/release/rustlitel)
+	codesign --force --sign - dist/rustlitel-cli-macos
+	@echo "-> dist/rustlitel-cli-macos"
 
 # One-time: generate the ed25519 self-update signing key. Store the PRIVATE key
 # in 1Password at UPDATE_SIGNING_KEY_REF and put UPDATE_PUBKEY in Makefile.local.

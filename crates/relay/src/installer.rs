@@ -17,6 +17,12 @@
 //! `RUSTLITEL_REVOKED_KEYS` ([`key_fingerprint`]). An agent may present either
 //! the master agent token or a valid join key.
 //!
+//! An **installer link** (`/i/<code>`) is stateless too, so it outlives a relay
+//! restart: the code is `<base64url(payload)>.<base64url(truncated HMAC)>` naming
+//! the OS, the machine's name and when the link expires. The join key is minted
+//! when the link is opened. Rotating the agent token invalidates every link, and
+//! `RUSTLITEL_REVOKED_KEYS` refuses one by the SHA-256 of its code.
+//!
 //! A **baked installer** is a stock agent binary with an [`InstallerConfig`]
 //! JSON trailer appended (`<json><MAGIC><u32 len>`), so running it needs no
 //! flags — it reads its own relay URL + join key and installs itself.
@@ -26,7 +32,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
 use base64::Engine;
 use hmac::{Hmac, Mac};
-use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
@@ -101,22 +106,52 @@ pub fn key_fingerprint(key: &str) -> String {
         .collect()
 }
 
-/// Append an [`InstallerConfig`] trailer to a stock agent binary.
-pub fn bake(base: &[u8], cfg: &InstallerConfig) -> Vec<u8> {
-    let json = serde_json::to_vec(cfg).expect("serialize config");
-    let mut out = Vec::with_capacity(base.len() + json.len() + 12);
-    out.extend_from_slice(base);
-    out.extend_from_slice(&json);
+/// The trailer that turns a stock agent binary into a baked installer.
+pub fn trailer(cfg: &InstallerConfig) -> Vec<u8> {
+    let mut out = serde_json::to_vec(cfg).expect("serialize config");
+    let len = out.len() as u32;
     out.extend_from_slice(INSTALLER_MAGIC);
-    out.extend_from_slice(&(json.len() as u32).to_le_bytes());
+    out.extend_from_slice(&len.to_le_bytes());
     out
 }
 
-/// A short, URL-safe code for an installer link (7 bytes -> ~10 chars).
-pub fn short_code() -> String {
-    let mut raw = [0u8; 7];
-    rand::thread_rng().fill_bytes(&mut raw);
-    B64.encode(raw)
+/// What an installer link stands for.
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+pub struct InstallerLink {
+    pub os: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Lifetime of the join key minted when the link is opened.
+    pub key_ttl_days: u64,
+    /// When the link itself stops working (unix seconds).
+    pub exp: u64,
+}
+
+/// 128 bits of HMAC are plenty and keep the link short. The key is distinct from
+/// the one signing join keys, so neither can pass for the other.
+fn link_sig(secret: &str, payload: &str) -> String {
+    let mut mac = HmacSha256::new_from_slice(format!("installer-link-v1:{secret}").as_bytes())
+        .expect("hmac key");
+    mac.update(payload.as_bytes());
+    B64.encode(&mac.finalize().into_bytes()[..16])
+}
+
+/// Sign `link` into the code that goes into `/i/<code>`.
+pub fn mint_link(secret: &str, link: &InstallerLink) -> String {
+    let payload = B64.encode(serde_json::to_vec(link).expect("serialize link"));
+    let sig = link_sig(secret, &payload);
+    format!("{payload}.{sig}")
+}
+
+/// Check a link code: correct signature and not expired.
+pub fn open_link(secret: &str, code: &str) -> Option<InstallerLink> {
+    let (payload, sig) = code.split_once('.')?;
+    let expected = link_sig(secret, payload);
+    if !bool::from(expected.as_bytes().ct_eq(sig.as_bytes())) {
+        return None;
+    }
+    let link: InstallerLink = serde_json::from_slice(&B64.decode(payload).ok()?).ok()?;
+    (link.exp > now()).then_some(link)
 }
 
 /// Turn the public HTTP origin into the wss/ws URL agents dial.
@@ -156,18 +191,40 @@ mod tests {
     }
 
     #[test]
-    fn bake_appends_trailer() {
+    fn trailer_is_what_the_agent_parses() {
         let cfg = InstallerConfig {
             relay: "wss://r".into(),
             token: "J1.x.y".into(),
             name: None,
             auto: Some("install".into()),
         };
-        let out = bake(b"BINARY", &cfg);
+        let out = trailer(&cfg);
         assert_eq!(&out[out.len() - 12..out.len() - 4], INSTALLER_MAGIC);
         let n = u32::from_le_bytes(out[out.len() - 4..].try_into().unwrap()) as usize;
-        assert!(out.starts_with(b"BINARY"));
-        assert!(n > 0 && n < out.len());
+        assert_eq!(n, out.len() - 12);
+        assert!(serde_json::from_slice::<InstallerConfig>(&out[..n]).is_ok());
+    }
+
+    #[test]
+    fn link_roundtrip_and_refusals() {
+        let link = |exp| InstallerLink {
+            os: "macos".into(),
+            name: Some("mac".into()),
+            key_ttl_days: 3650,
+            exp,
+        };
+        let code = mint_link("secret", &link(now() + 60));
+        assert_eq!(open_link("secret", &code), Some(link(code_exp(&code))));
+        assert_eq!(open_link("other", &code), None);
+        assert_eq!(open_link("secret", &mint_link("secret", &link(now() - 1))), None);
+        assert_eq!(open_link("secret", "garbage"), None);
+        // A join key is not a link, even with the same secret.
+        assert_eq!(open_link("secret", &mint_join_key("secret", "x", 60)), None);
+    }
+
+    fn code_exp(code: &str) -> u64 {
+        let payload = code.split('.').next().unwrap();
+        serde_json::from_slice::<InstallerLink>(&B64.decode(payload).unwrap()).unwrap().exp
     }
 
     #[test]

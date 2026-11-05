@@ -107,6 +107,29 @@ fn load_tokens(relay: &str) -> Result<Tokens> {
     Ok(serde_json::from_slice(&data)?)
 }
 
+/// The file holds a long-lived refresh token: readable by the owner only.
+fn save_tokens(relay: &str, tokens: &Tokens) -> Result<()> {
+    let path = token_path(relay)?;
+    let data = serde_json::to_vec_pretty(tokens)?;
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&path)?;
+        // `mode` applies only to a new file; one from an older version is 0644.
+        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        f.write_all(&data)?;
+    }
+    #[cfg(not(unix))]
+    std::fs::write(&path, data)?;
+    Ok(())
+}
+
 // --- auth ------------------------------------------------------------------
 
 #[derive(Deserialize)]
@@ -178,11 +201,23 @@ async fn login(relay: &str) -> Result<()> {
         .json()
         .await?;
 
-    let da: DeviceAuth = http
+    // offline_access: a plain refresh token dies with the realm's SSO session
+    // (30 min idle, 10 h at most on ours); an offline one lasts until it goes
+    // unused for the realm's offline idle timeout. Some realms refuse the scope.
+    let mut resp = http
         .post(&disc.device_authorization_endpoint)
-        .form(&[("client_id", client_id.as_str()), ("scope", "openid profile")])
+        .form(&[("client_id", client_id.as_str()), ("scope", "openid profile offline_access")])
         .send()
-        .await?
+        .await?;
+    if resp.status() == reqwest::StatusCode::BAD_REQUEST {
+        eprintln!("note: the realm refused offline_access; this login will expire with the SSO session");
+        resp = http
+            .post(&disc.device_authorization_endpoint)
+            .form(&[("client_id", client_id.as_str()), ("scope", "openid profile")])
+            .send()
+            .await?;
+    }
+    let da: DeviceAuth = resp
         .error_for_status()
         .context("device authorization (is the CLI client public + device flow enabled?)")?
         .json()
@@ -220,7 +255,7 @@ async fn login(relay: &str) -> Result<()> {
                 refresh_token: t.refresh_token,
                 expires_at: now() + t.expires_in.saturating_sub(30),
             };
-            std::fs::write(token_path(relay)?, serde_json::to_vec_pretty(&tokens)?)?;
+            save_tokens(relay, &tokens)?;
             save_default_relay(relay);
             println!("✓ signed in. Tokens cached.");
             return Ok(());
@@ -260,8 +295,14 @@ async fn access_token(relay: &str) -> Result<String> {
         ])
         .send()
         .await?;
-    if !resp.status().is_success() {
+    let status = resp.status();
+    if status == reqwest::StatusCode::BAD_REQUEST || status == reqwest::StatusCode::UNAUTHORIZED {
         bail!("session expired — run `rustlitel login`");
+    }
+    // Anything else (Keycloak restarting, a proxy error) says nothing about the
+    // login, which stays cached for the next try.
+    if !status.is_success() {
+        bail!("could not refresh the session: the identity provider returned {status}");
     }
     let nt: TokenResp = resp.json().await?;
     t.access_token = nt.access_token;
@@ -269,7 +310,7 @@ async fn access_token(relay: &str) -> Result<String> {
         t.refresh_token = nt.refresh_token;
     }
     t.expires_at = now() + nt.expires_in.saturating_sub(30);
-    std::fs::write(token_path(relay)?, serde_json::to_vec_pretty(&t)?)?;
+    save_tokens(relay, &t)?;
     Ok(t.access_token)
 }
 

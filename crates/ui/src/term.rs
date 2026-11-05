@@ -5,6 +5,10 @@
 use egui::{Color32, FontId, Key};
 use ewebsock::{WsEvent, WsMessage, WsReceiver, WsSender};
 
+const KEY_BAR_BUTTON: f32 = 32.0;
+const KEY_BAR_GAP: f32 = 6.0;
+const KEY_BAR_HEIGHT: f32 = KEY_BAR_BUTTON + KEY_BAR_GAP + 4.0;
+
 pub struct Terminal {
     parser: vt100::Parser,
     rows: u16,
@@ -14,6 +18,8 @@ pub struct Terminal {
     /// Active text selection as (anchor, head) cells, each `(row, col)`.
     /// Unnormalized; normalize with [`norm`] before use.
     sel: Option<((u16, u16), (u16, u16))>,
+    /// Touch key bar: the next typed character goes out as Ctrl+character.
+    ctrl_armed: bool,
     pub status: String,
     pub open: bool,
     pub closed: bool,
@@ -52,6 +58,7 @@ impl Terminal {
             tx,
             rx,
             sel: None,
+            ctrl_armed: false,
             status: "connecting…".to_string(),
             open: false,
             closed: false,
@@ -115,7 +122,15 @@ impl Terminal {
             )
         });
 
-        let avail = ui.available_size();
+        let touch = crate::mobile::is_touch();
+        if touch {
+            crate::mobile::text_target(ui.available_rect_before_wrap());
+        }
+
+        let mut avail = ui.available_size();
+        if touch {
+            avail.y = (avail.y - KEY_BAR_HEIGHT).max(rh);
+        }
         let cols = ((avail.x / cw).floor() as u16).clamp(20, 400);
         let rows = ((avail.y / rh).floor() as u16).clamp(5, 200);
         self.resize(cols, rows);
@@ -214,9 +229,51 @@ impl Terminal {
             painter.rect_filled(cur, 0.0, color.linear_multiply(0.6));
         }
 
+        if touch {
+            // Asks eframe to keep its text agent, the source of the on-screen
+            // keyboard's input, focused while the terminal is shown.
+            ui.ctx().output_mut(|o| {
+                o.ime = Some(egui::output::IMEOutput { rect, cursor_rect: rect });
+            });
+            self.key_bar(ui);
+        }
+
         if response.has_focus() {
             self.handle_input(ui);
         }
+    }
+
+    /// The keys a phone keyboard does not have.
+    fn key_bar(&mut self, ui: &mut egui::Ui) {
+        let keys: [(&str, &[u8]); 8] = [
+            ("Esc", b"\x1b"),
+            ("Tab", b"\t"),
+            ("^C", b"\x03"),
+            ("^D", b"\x04"),
+            ("\u{2190}", b"\x1b[D"),
+            ("\u{2191}", b"\x1b[A"),
+            ("\u{2193}", b"\x1b[B"),
+            ("\u{2192}", b"\x1b[C"),
+        ];
+        let accent = crate::theme::current(ui.ctx()).accent;
+        ui.add_space(KEY_BAR_GAP);
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            let ctrl = egui::Button::new(egui::RichText::new("Ctrl").size(13.0))
+                .fill(if self.ctrl_armed { accent } else { egui::Color32::TRANSPARENT })
+                .min_size(egui::vec2(38.0, KEY_BAR_BUTTON));
+            if ui.add(ctrl).clicked() {
+                self.ctrl_armed = !self.ctrl_armed;
+            }
+            for (label, bytes) in keys {
+                let key = egui::Button::new(egui::RichText::new(label).size(13.0))
+                    .fill(egui::Color32::TRANSPARENT)
+                    .min_size(egui::vec2(32.0, KEY_BAR_BUTTON));
+                if ui.add(key).clicked() {
+                    self.send_bytes(bytes);
+                }
+            }
+        });
     }
 
     fn handle_input(&mut self, ui: &mut egui::Ui) {
@@ -237,7 +294,13 @@ impl Terminal {
         let mut out: Vec<u8> = Vec::new();
         for ev in events {
             match ev {
-                egui::Event::Text(t) => out.extend_from_slice(t.as_bytes()),
+                egui::Event::Text(t) | egui::Event::Ime(egui::ImeEvent::Commit(t)) => {
+                    if std::mem::take(&mut self.ctrl_armed) {
+                        out.extend_from_slice(&ctrl_bytes(&t));
+                    } else {
+                        out.extend_from_slice(t.as_bytes());
+                    }
+                }
                 egui::Event::Paste(t) => out.extend_from_slice(t.as_bytes()),
                 egui::Event::Key {
                     key,
@@ -286,6 +349,17 @@ impl Terminal {
             lines.push(line);
         }
         Some(lines.join("\n"))
+    }
+}
+
+/// `text` as typed with Ctrl held: ASCII letters and the C0 punctuation become
+/// control bytes, anything else goes out unchanged.
+fn ctrl_bytes(text: &str) -> Vec<u8> {
+    match text.as_bytes() {
+        [c @ (b'a'..=b'z' | b'A'..=b'Z' | b'@' | b'[' | b'\\' | b']' | b'^' | b'_')] => {
+            vec![c.to_ascii_uppercase() & 0x1f]
+        }
+        other => other.to_vec(),
     }
 }
 
@@ -412,4 +486,18 @@ fn urlencode(s: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ctrl_bytes;
+
+    #[test]
+    fn ctrl_maps_letters_and_leaves_the_rest() {
+        assert_eq!(ctrl_bytes("c"), [0x03]);
+        assert_eq!(ctrl_bytes("C"), [0x03]);
+        assert_eq!(ctrl_bytes("["), [0x1b]);
+        assert_eq!(ctrl_bytes("1"), b"1");
+        assert_eq!(ctrl_bytes("\u{44f}"), "\u{44f}".as_bytes());
+    }
 }

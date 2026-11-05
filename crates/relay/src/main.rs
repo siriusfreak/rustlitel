@@ -37,7 +37,7 @@ async fn main() -> anyhow::Result<()> {
     let operator_token = require_token("RUSTLITEL_OPERATOR_TOKEN")?;
     let agent_token = require_token("RUSTLITEL_AGENT_TOKEN")?;
     let public_origin = std::env::var("RUSTLITEL_PUBLIC_ORIGIN").ok().filter(|s| !s.is_empty());
-    let ttl_hours: u64 = env_or("RUSTLITEL_SESSION_TTL_HOURS", "12").parse().unwrap_or(12);
+    let ttl_hours: u64 = env_or("RUSTLITEL_SESSION_TTL_HOURS", "720").parse().unwrap_or(720);
     let cookie_secure = env_or("RUSTLITEL_COOKIE_SECURE", "1") != "0";
     let max_agents: usize = env_or("RUSTLITEL_MAX_AGENTS", "512").parse().unwrap_or(512);
     let open_timeout_secs: u64 = env_or("RUSTLITEL_OPEN_TIMEOUT_SECS", "30").parse().unwrap_or(30);
@@ -49,7 +49,7 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or(120);
     let agents_dir = env_or("RUSTLITEL_AGENTS_DIR", "/srv/agents");
     let ui_dir = env_or("RUSTLITEL_UI_DIR", "/srv/ui");
-    let short_link_ttl_days: u64 = env_or("RUSTLITEL_SHORT_LINK_TTL_DAYS", "7").parse().unwrap_or(7);
+    let short_link_ttl_days: u64 = env_or("RUSTLITEL_SHORT_LINK_TTL_DAYS", "30").parse().unwrap_or(30);
     // SHA-256 of each join key to refuse, comma- or space-separated.
     let revoked_keys: std::collections::HashSet<String> = env_or("RUSTLITEL_REVOKED_KEYS", "")
         .split(|c: char| c == ',' || c.is_whitespace())
@@ -118,7 +118,6 @@ async fn main() -> anyhow::Result<()> {
         agents_dir,
         ui_dir,
         oidc,
-        short_links: Mutex::new(HashMap::new()),
         short_link_ttl: Duration::from_secs(short_link_ttl_days * 86400),
         max_agents,
     });

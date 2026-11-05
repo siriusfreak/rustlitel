@@ -22,7 +22,8 @@ make image           # -> $(REGISTRY)/$(IMAGE):latest   (from Makefile.local)
 ```
 
 The image bundles the relay, the Linux agent, the macOS/Windows agents staged
-into `dist/` (see `make agent-windows` + `make sign-windows-agent`), and the
+into `dist/` (see `make agent-windows` + `make sign-windows-agent`,
+`make agent-macos`, `make cli-macos`), and the
 compiled web UI (`make ui`).
 
 ## Run the relay

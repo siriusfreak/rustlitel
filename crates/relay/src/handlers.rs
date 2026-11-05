@@ -528,10 +528,9 @@ pub async fn download(
         return StatusCode::BAD_REQUEST.into_response();
     }
     let path = std::path::Path::new(&state.agents_dir).join(&file);
-    match tokio::fs::read(&path).await {
-        Ok(bytes) => binary_download(&file, bytes),
-        Err(_) => (StatusCode::NOT_FOUND, "binary not available").into_response(),
-    }
+    stream_file(&path, &file, Vec::new())
+        .await
+        .unwrap_or_else(|| (StatusCode::NOT_FOUND, "binary not available").into_response())
 }
 
 #[derive(Deserialize)]
@@ -579,26 +578,15 @@ pub async fn make_installer(
     // reconnect), so default it long-lived. Revoke one through
     // RUSTLITEL_REVOKED_KEYS, all of them by rotating RUSTLITEL_AGENT_TOKEN.
     let ttl_days = req.ttl_days.unwrap_or(3650).clamp(1, 3650);
-    let label = req.name.clone().unwrap_or_else(|| "installer".into());
-    let join = crate::installer::mint_join_key(&state.agent_token, &label, ttl_days * 86400);
-
-    // Store the (long) baked params behind a short code so the copied URL is
-    // short: https://relay/i/<code>. The link itself expires with short_link_ttl.
-    let code = crate::installer::short_code();
-    {
-        let mut links = state.short_links.lock().await;
-        let now = std::time::Instant::now();
-        links.retain(|_, v| v.expiry > now);
-        links.insert(
-            code.clone(),
-            crate::state::ShortLink {
-                os: os.to_string(),
-                name: req.name.clone(),
-                join_key: join,
-                expiry: now + state.short_link_ttl,
-            },
-        );
-    }
+    let code = crate::installer::mint_link(
+        &state.agent_token,
+        &crate::installer::InstallerLink {
+            os: os.to_string(),
+            name: req.name.clone(),
+            key_ttl_days: ttl_days,
+            exp: unix_now() + state.short_link_ttl.as_secs(),
+        },
+    );
 
     let mut url = match url::Url::parse(origin) {
         Ok(u) => u,
@@ -606,7 +594,7 @@ pub async fn make_installer(
     };
     url.set_path(&format!("/i/{code}"));
 
-    tracing::info!(os = %os, label = %label, ttl_days, "generated installer short link");
+    tracing::info!(os = %os, name = ?req.name, ttl_days, "generated installer link");
     Json(InstallerLink {
         url: url.to_string(),
         expires_days: state.short_link_ttl.as_secs() / 86400,
@@ -637,25 +625,23 @@ pub async fn download_installer(
     serve_baked(&state, os, q.name, q.key).await
 }
 
-/// Serve the baked installer for a short link `/i/<code>`. Unauthenticated: the
-/// (unexpired) short code is the capability, standing in for the join key.
+/// Serve the baked installer for a link `/i/<code>`. Unauthenticated: the signed,
+/// unexpired code is the capability, and the join key is minted here.
 pub async fn download_short(
     State(state): State<Arc<AppState>>,
     Path(code): Path<String>,
 ) -> Response {
-    let link = {
-        let mut links = state.short_links.lock().await;
-        let now = std::time::Instant::now();
-        links.retain(|_, v| v.expiry > now);
-        links.get(&code).cloned()
+    let link = crate::installer::open_link(&state.agent_token, &code)
+        .filter(|_| !state.revoked_keys.contains(&crate::installer::key_fingerprint(&code)));
+    let Some(link) = link else {
+        return (StatusCode::NOT_FOUND, "installer link expired or invalid").into_response();
     };
-    match link {
-        Some(l) => serve_baked(&state, &l.os, l.name, l.join_key).await,
-        None => (StatusCode::NOT_FOUND, "installer link expired or invalid").into_response(),
-    }
+    let label = link.name.as_deref().unwrap_or("installer");
+    let key = crate::installer::mint_join_key(&state.agent_token, label, link.key_ttl_days * 86400);
+    serve_baked(&state, &link.os, link.name, key).await
 }
 
-/// Bake and serve the installer binary for `os` with the given name + join key.
+/// Stream the installer binary for `os` with the given name + join key.
 async fn serve_baked(
     state: &AppState,
     os: &str,
@@ -671,18 +657,16 @@ async fn serve_baked(
     let Some(relay_ws) = crate::installer::origin_to_ws(origin) else {
         return (StatusCode::SERVICE_UNAVAILABLE, "bad public origin").into_response();
     };
-    let path = std::path::Path::new(&state.agents_dir).join(base_file);
-    let base = match tokio::fs::read(&path).await {
-        Ok(b) => b,
-        Err(_) => return (StatusCode::NOT_FOUND, "base binary not bundled").into_response(),
-    };
     let cfg = rustlitel_proto::InstallerConfig {
         relay: relay_ws,
         token: key,
         name,
         auto: Some("install".into()),
     };
-    binary_download(out_file, crate::installer::bake(&base, &cfg))
+    let path = std::path::Path::new(&state.agents_dir).join(base_file);
+    stream_file(&path, out_file, crate::installer::trailer(&cfg))
+        .await
+        .unwrap_or_else(|| (StatusCode::NOT_FOUND, "base binary not bundled").into_response())
 }
 
 /// Public config the `wrs` CLI fetches to start its Keycloak device-flow login.
@@ -785,15 +769,14 @@ pub async fn agent_update(
     }
 
     // No sidecar: unsigned manifest (agents with a baked key will decline).
-    let bytes = match tokio::fs::read(dir.join(base_file)).await {
-        Ok(b) => b,
-        Err(_) => return (StatusCode::NOT_FOUND, "binary not available").into_response(),
+    let Some((sha256, size)) = sha256_of_file(&dir.join(base_file)).await else {
+        return (StatusCode::NOT_FOUND, "binary not available").into_response();
     };
     Json(UpdateManifest {
         version: rustlitel_proto::BUILD_ID.to_string(),
         build_epoch: rustlitel_proto::build_epoch(),
-        sha256: sha256_hex(&bytes),
-        size: bytes.len() as u64,
+        sha256,
+        size,
         sig: None,
     })
     .into_response()
@@ -814,20 +797,39 @@ pub async fn agent_binary(
         return (StatusCode::BAD_REQUEST, "unknown os").into_response();
     };
     let path = std::path::Path::new(&state.agents_dir).join(base_file);
-    match tokio::fs::read(&path).await {
-        Ok(bytes) => binary_download(base_file, bytes),
-        Err(_) => (StatusCode::NOT_FOUND, "binary not available").into_response(),
-    }
+    stream_file(&path, base_file, Vec::new())
+        .await
+        .unwrap_or_else(|| (StatusCode::NOT_FOUND, "binary not available").into_response())
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
-    let mut s = String::with_capacity(64);
-    for b in digest {
-        use std::fmt::Write;
-        let _ = write!(s, "{b:02x}");
+/// Hash a file without holding it in memory; returns (hex digest, length).
+async fn sha256_of_file(path: &std::path::Path) -> Option<(String, u64)> {
+    use std::fmt::Write;
+    use tokio::io::AsyncReadExt;
+    let mut file = tokio::fs::File::open(path).await.ok()?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut size = 0u64;
+    loop {
+        let n = file.read(&mut buf).await.ok()?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        size += n as u64;
     }
-    s
+    let mut hex = String::with_capacity(64);
+    for b in hasher.finalize() {
+        let _ = write!(hex, "{b:02x}");
+    }
+    Some((hex, size))
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 fn installer_bases(os: &str) -> Option<(&'static str, &'static str)> {
@@ -839,18 +841,23 @@ fn installer_bases(os: &str) -> Option<(&'static str, &'static str)> {
     }
 }
 
-fn binary_download(filename: &str, bytes: Vec<u8>) -> Response {
-    let mut resp = bytes.into_response();
+/// A file followed by `trailer`, as a download. Streamed: the pod's memory limit
+/// is smaller than a handful of agent binaries, and an OOM kill drops every agent
+/// and terminal. `None` if the file cannot be opened.
+async fn stream_file(path: &std::path::Path, filename: &str, trailer: Vec<u8>) -> Option<Response> {
+    let file = tokio::fs::File::open(path).await.ok()?;
+    let size = file.metadata().await.ok()?.len() + trailer.len() as u64;
+    let trailer = futures_util::stream::once(async move { Ok(axum::body::Bytes::from(trailer)) });
+    let mut resp = axum::body::Body::from_stream(tokio_util::io::ReaderStream::new(file).chain(trailer))
+        .into_response();
     let h = resp.headers_mut();
-    h.insert(
-        header::CONTENT_TYPE,
-        "application/octet-stream".parse().unwrap(),
-    );
+    h.insert(header::CONTENT_TYPE, "application/octet-stream".parse().unwrap());
+    h.insert(header::CONTENT_LENGTH, size.into());
     h.insert(
         header::CONTENT_DISPOSITION,
         format!("attachment; filename=\"{filename}\"").parse().unwrap(),
     );
-    resp
+    Some(resp)
 }
 
 // ---------------------------------------------------------------------------

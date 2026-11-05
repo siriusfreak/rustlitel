@@ -6,6 +6,7 @@
 //! switch.
 
 mod app;
+mod mobile;
 mod term;
 mod theme;
 
@@ -38,6 +39,7 @@ fn main() {
         if let Err(e) = result {
             log::error!("eframe start failed: {e:?}");
         }
+        mobile::install();
     });
 }
 

@@ -28,17 +28,6 @@ pub enum SessionSignal {
     Declined(String),
 }
 
-/// A short installer link: a small random code standing in for the (long) baked
-/// join key, so the URL an operator copies stays short. Kept in memory with a
-/// TTL; lost on relay restart (just regenerate the link).
-#[derive(Debug, Clone)]
-pub struct ShortLink {
-    pub os: String,
-    pub name: Option<String>,
-    pub join_key: String,
-    pub expiry: Instant,
-}
-
 /// An exec event coming back on the control link, delivered to the waiting
 /// `POST /api/exec` handler for its `exec_id`.
 #[derive(Debug, Clone)]
@@ -138,9 +127,7 @@ pub struct AppState {
     /// OIDC (Keycloak) operator login, when configured; `None` falls back to
     /// operator-token login.
     pub oidc: Option<crate::oidc::Oidc>,
-    /// Short installer links: code -> baked-installer params. In memory, TTL'd.
-    pub short_links: Mutex<HashMap<String, ShortLink>>,
-    /// How long a short installer link stays valid.
+    /// How long an installer link stays valid.
     pub short_link_ttl: std::time::Duration,
     /// Maximum number of concurrently registered agents (DoS cap).
     pub max_agents: usize,

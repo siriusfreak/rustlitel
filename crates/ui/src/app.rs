@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 use egui::{vec2, Align, Color32, FontId, Layout, Margin, Rect, RichText, Rounding, Sense, Stroke};
 use serde::Deserialize;
 
+use crate::mobile;
 use crate::term::Terminal;
 use crate::theme::{self, Palette, ThemePref};
 
@@ -90,6 +91,8 @@ pub struct RustlitelApp {
     agents_loading: bool,
     last_agents_fetch: f64,
     selected: Option<String>,
+    /// Narrow screen: the agent list replaces the selected agent's view.
+    show_agents: bool,
 
     tab: CentralTab,
     term: Option<Terminal>,
@@ -135,6 +138,7 @@ impl RustlitelApp {
             agents_loading: false,
             last_agents_fetch: 0.0,
             selected: None,
+            show_agents: false,
             tab: CentralTab::Terminal,
             term: None,
             term_shell: String::new(),
@@ -288,6 +292,12 @@ impl RustlitelApp {
                     self.agents_error = None;
                     self.agents = list;
                 }
+                Msg::Agents(Err(e)) if e == "HTTP 401" => {
+                    // The session is gone: show the way back in, not a red "401".
+                    self.agents_loading = false;
+                    self.auth = Auth::Anon;
+                    self.reset_session_state();
+                }
                 Msg::Agents(Err(e)) => {
                     self.agents_loading = false;
                     self.agents_error = Some(e);
@@ -380,7 +390,7 @@ impl RustlitelApp {
                     .rounding(12.0)
                     .inner_margin(Margin::same(20.0))
                     .show(ui, |ui| {
-                        ui.set_width(320.0);
+                        ui.set_width(320.0_f32.min(ui.ctx().screen_rect().width() - 72.0));
                         ui.vertical_centered_justified(|ui| {
                             // With Keycloak configured, that's the only web
                             // login — the operator token stays a CLI/script
@@ -408,6 +418,7 @@ impl RustlitelApp {
                                     .margin(Margin::symmetric(10.0, 7.0))
                                     .desired_width(f32::INFINITY),
                             );
+                            mobile::text_target(field.rect);
                             ui.add_space(8.0);
                             let submit = (field.lost_focus()
                                 && ui.input(|i| i.key_pressed(egui::Key::Enter)))
@@ -470,7 +481,9 @@ impl RustlitelApp {
                             user_chip(ui, &p, u);
                             ui.add_space(6.0);
                         }
-                        self.theme_segmented(ui, true);
+                        if !is_narrow(ui.ctx()) {
+                            self.theme_segmented(ui, true);
+                        }
                     });
                 });
             });
@@ -489,7 +502,14 @@ impl RustlitelApp {
                     .inner_margin(Margin::symmetric(10.0, 10.0))
                     .stroke(Stroke::new(0.5_f32,p.border)),
             )
-            .show(ctx, |ui| {
+            .show(ctx, |ui| self.ui_agents(ui, &p));
+    }
+
+    fn ui_agents(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        let ctx = ui.ctx().clone();
+        let ctx = &ctx;
+        {
+            {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("Agents").size(13.0).strong().color(p.text_secondary));
                     ui.label(RichText::new(format!("· {}", self.agents.len())).size(13.0).color(p.text_muted));
@@ -522,16 +542,18 @@ impl RustlitelApp {
                         let agents = self.agents.clone();
                         for a in &agents {
                             let selected = self.selected.as_deref() == Some(&a.agent_id);
-                            if agent_row(ui, &p, a, selected).clicked() {
+                            if agent_row(ui, p, a, selected).clicked() {
                                 self.select_agent(&a.agent_id);
+                                self.show_agents = false;
                             }
                         }
                         ui.add_space(8.0);
                         ui.separator();
-                        self.ui_installer(ui, &p);
-                        self.ui_downloads(ui, &p);
+                        self.ui_installer(ui, p);
+                        self.ui_downloads(ui, p);
                     });
-            });
+            }
+        }
     }
 
     fn select_agent(&mut self, id: &str) {
@@ -565,11 +587,12 @@ impl RustlitelApp {
                             }
                         });
                 });
-                ui.add(
+                let name = ui.add(
                     egui::TextEdit::singleline(&mut self.inst_name)
                         .hint_text("name (optional)")
                         .desired_width(f32::INFINITY),
                 );
+                mobile::text_target(name.rect);
                 ui.add_space(4.0);
                 let ctx = ui.ctx().clone();
                 if accent_button(ui, p, "Generate link", !self.inst_busy).clicked() && !self.inst_busy {
@@ -590,6 +613,17 @@ impl RustlitelApp {
                     }
                     let mut shown = url.clone();
                     ui.add(egui::TextEdit::singleline(&mut shown).font(FontId::monospace(11.0)).desired_width(f32::INFINITY));
+                    if self.inst_os != "windows" {
+                        // Through curl: a browser download is not executable and
+                        // macOS quarantines it.
+                        let cmd = format!("curl -fsSL {url} -o rustlitel-agent && chmod +x rustlitel-agent && ./rustlitel-agent");
+                        ui.label(RichText::new("On the target, in a terminal:").size(11.5).color(p.text_muted));
+                        let mut shown = cmd.clone();
+                        ui.add(egui::TextEdit::multiline(&mut shown).font(FontId::monospace(11.0)).desired_rows(3).desired_width(f32::INFINITY));
+                        if ui.add(egui::Button::new(RichText::new("Copy command").size(12.5)).fill(Color32::TRANSPARENT).stroke(Stroke::new(0.5_f32,p.border_strong))).clicked() {
+                            ui.ctx().copy_text(cmd);
+                        }
+                    }
                 }
             });
     }
@@ -602,6 +636,7 @@ impl RustlitelApp {
                     ("Windows (.exe)", "rustlitel-agent-windows.exe"),
                     ("macOS", "rustlitel-agent-macos"),
                     ("Linux", "rustlitel-agent-linux"),
+                    ("CLI for macOS", "rustlitel-cli-macos"),
                 ] {
                     ui.hyperlink_to(RichText::new(label).size(12.5), self.url(&format!("/download/{file}")));
                 }
@@ -623,6 +658,12 @@ impl RustlitelApp {
                     return;
                 };
                 let agent = self.agents.iter().find(|a| a.agent_id == agent_id).cloned();
+
+                if is_narrow(ui.ctx())
+                    && ui.add(egui::Button::new(RichText::new("\u{2190} Agents").size(12.5).color(p.text_secondary)).fill(Color32::TRANSPARENT).stroke(Stroke::NONE)).clicked()
+                {
+                    self.show_agents = true;
+                }
 
                 // header row
                 ui.horizontal(|ui| {
@@ -735,7 +776,7 @@ impl RustlitelApp {
                 }
             });
             ui.add_space(6.0);
-            ui.label(RichText::new("Opens an interactive shell on the agent. Click the view, then type.").size(12.5).color(p.text_muted));
+            ui.label(RichText::new("Opens an interactive shell on the agent. Tap or click the view, then type.").size(12.5).color(p.text_muted));
             return;
         }
 
@@ -755,13 +796,14 @@ impl RustlitelApp {
     fn ui_exec(&mut self, ui: &mut egui::Ui, p: &Palette, agent_id: &str) {
         ui.label(RichText::new("Command").size(12.5).color(p.text_secondary));
         ui.add_space(4.0);
-        ui.add(
+        let cmd = ui.add(
             egui::TextEdit::multiline(&mut self.exec_cmd)
                 .desired_rows(3)
                 .font(FontId::monospace(13.0))
                 .desired_width(f32::INFINITY)
                 .hint_text("Get-Service Spooler | Restart-Service"),
         );
+        mobile::text_target(cmd.rect);
         ui.add_space(6.0);
         ui.horizontal(|ui| {
             let shells = self
@@ -785,7 +827,8 @@ impl RustlitelApp {
                     });
             }
             ui.label(RichText::new("timeout (s)").size(12.5).color(p.text_secondary));
-            ui.add(egui::TextEdit::singleline(&mut self.exec_timeout).hint_text("default").desired_width(64.0));
+            let timeout = ui.add(egui::TextEdit::singleline(&mut self.exec_timeout).hint_text("default").desired_width(64.0));
+            mobile::text_target(timeout.rect);
             let ctx = ui.ctx().clone();
             let can_run = !self.exec_busy && !self.exec_cmd.trim().is_empty();
             if accent_button(ui, p, "Run", can_run).clicked() && can_run {
@@ -872,6 +915,7 @@ impl RustlitelApp {
 
 impl eframe::App for RustlitelApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        mobile::begin_frame();
         self.ensure_theme(ctx);
         self.drain(ctx);
 
@@ -917,14 +961,30 @@ impl eframe::App for RustlitelApp {
                     });
                 });
         }
-        self.ui_side(ctx);
-        self.ui_central(ctx);
+        if is_narrow(ctx) && (self.show_agents || self.selected.is_none()) {
+            let p = theme::current(ctx);
+            egui::CentralPanel::default()
+                .frame(egui::Frame::none().fill(p.card).inner_margin(Margin::same(12.0)))
+                .show(ctx, |ui| self.ui_agents(ui, &p));
+            // Keeps an open terminal's socket drained while its view is away.
+            ctx.request_repaint_after(std::time::Duration::from_millis(250));
+        } else {
+            if !is_narrow(ctx) {
+                self.ui_side(ctx);
+            }
+            self.ui_central(ctx);
+        }
         self.ui_confirm_uninstall(ctx);
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         eframe::set_value(storage, "theme", &self.theme);
     }
+}
+
+/// Too narrow for the agent list next to the terminal (a phone held upright).
+fn is_narrow(ctx: &egui::Context) -> bool {
+    ctx.screen_rect().width() < 700.0
 }
 
 // --- small painted widgets --------------------------------------------------

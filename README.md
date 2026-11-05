@@ -50,7 +50,8 @@ The relay also checks the browser `Origin` on WebSocket upgrades / login when
 
 * `crates/relay` — `rustlitel-relay`: axum HTTP/WS server. Serves the web UI, the
   operator terminal WS, the agent control/session WS, and `/api/*`. Holds no
-  state beyond in-memory maps; one replica.
+  state beyond in-memory maps (connected agents, open terminals; sessions and
+  installer links are signed tokens); one replica.
 * `crates/agent` — `rustlitel-agent`: dials the relay, runs PTYs (`portable-pty` →
   ConPTY on Windows) and non-interactive `exec`. On Windows it can install
   itself as an auto-start service.
@@ -74,6 +75,12 @@ Release `.exe`es are produced by CI (`.github/workflows/build.yml`, MSVC
 `windows-latest`) and uploaded as the `rustlitel-agent-windows-x64` artifact. To
 cross-build from Unix: `rustup target add x86_64-pc-windows-gnu`, install the
 mingw-w64 linker, then `make agent-windows`.
+
+### macOS binaries
+
+`make agent-macos cli-macos` builds universal (arm64 + x86_64) binaries into
+`dist/`, from where the image serves them. On macOS the agent runs in the
+foreground and asks for consent on the console; there is no launchd `install`.
 
 ---
 
@@ -99,7 +106,8 @@ Open <http://127.0.0.1:8099>, sign in with the operator token.
 | `RUSTLITEL_OPERATOR_TOKEN` | *(required)* | operator login / Bearer token |
 | `RUSTLITEL_AGENT_TOKEN` | *(required)* | agent enrollment token (must differ) |
 | `RUSTLITEL_PUBLIC_ORIGIN` | *(unset)* | e.g. `https://relay.example.com`; enables Origin checks |
-| `RUSTLITEL_SESSION_TTL_HOURS` | `12` | operator session lifetime |
+| `RUSTLITEL_SESSION_TTL_HOURS` | `720` | operator session lifetime (signed cookie, survives a relay restart; rotate the operator token to end all sessions) |
+| `RUSTLITEL_SHORT_LINK_TTL_DAYS` | `30` | installer link lifetime (signed, survives a relay restart; refuse one by adding the SHA-256 of its code to `RUSTLITEL_REVOKED_KEYS`) |
 | `RUSTLITEL_COOKIE_SECURE` | `1` | set `0` only for local HTTP |
 | `RUSTLITEL_OPEN_TIMEOUT_SECS` | `30` | how long to wait for an agent to accept a session |
 | `RUSTLITEL_EXEC_DEFAULT_TIMEOUT_SECS` | `120` | default exec timeout |
