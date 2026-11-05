@@ -24,26 +24,78 @@
         position: fixed;
         inset: 0;
         display: flex;
+        flex-direction: column;
+        gap: 10px;
         align-items: center;
         justify-content: center;
         font: 14px system-ui, sans-serif;
         color: #858d9a;
       }
-      /* First-paint background; egui paints over it once the wasm loads. */
-      body {
-        background: #11151c;
+      #loading-track {
+        width: 240px;
+        max-width: 70vw;
+        height: 4px;
+        border-radius: 2px;
+        overflow: hidden;
+        background: rgba(133, 141, 154, 0.25);
       }
-      @media (prefers-color-scheme: light) {
-        body {
-          background: #eef0f2;
-        }
+      #loading-bar {
+        width: 0;
+        height: 100%;
+        background: #f0a83a;
       }
     </style>
   </head>
   <body>
-    <div id="loading">Loading rustlitel…</div>
+    <div id="loading">
+      <div id="loading-text">Loading rustlitel…</div>
+      <div id="loading-track"><div id="loading-bar"></div></div>
+    </div>
     <canvas id="canvas"></canvas>
     <script>
+      // Progress of the wasm download: count the bytes of the one fetch that
+      // brings it, then hand them on unchanged. The browser counts decoded bytes,
+      // so the total comes from the relay's X-Decoded-Length: Content-Length of a
+      // compressed file is the smaller number.
+      (() => {
+        const text = document.getElementById("loading-text");
+        const bar = document.getElementById("loading-bar");
+        const failed = () => {
+          text.textContent = "Could not load rustlitel. Check the connection and reload the page.";
+        };
+        const realFetch = window.fetch;
+        window.fetch = async (input, init) => {
+          const url = String(input.url || input.href || input);
+          if (!url.endsWith(".wasm")) return realFetch(input, init);
+          window.fetch = realFetch;
+          let res;
+          try {
+            res = await realFetch(input, init);
+          } catch (e) {
+            failed();
+            throw e;
+          }
+          if (!res.ok) failed();
+          const total = Number(res.headers.get("x-decoded-length") || res.headers.get("content-length"));
+          if (!res.ok || !res.body || !total) return res;
+          let current = 0;
+          const counter = new TransformStream({
+            transform(chunk, controller) {
+              current += chunk.byteLength;
+              const percent = Math.min(100, Math.round((current / total) * 100));
+              bar.style.width = percent + "%";
+              text.textContent = "Loading rustlitel… " + percent + "%";
+              controller.enqueue(chunk);
+            },
+            flush() {
+              bar.style.width = "100%";
+              text.textContent = "Starting…";
+            },
+          });
+          return new Response(res.body.pipeThrough(counter), { status: res.status, headers: res.headers });
+        };
+      })();
+
       // The on-screen keyboard shrinks only the visual viewport. Fit the page to
       // it, or the bottom of the terminal, cursor included, stays under the keyboard.
       if (window.visualViewport) {

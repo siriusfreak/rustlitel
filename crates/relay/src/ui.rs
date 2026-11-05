@@ -38,18 +38,22 @@ async fn read_file(dir: &str, rel: &str, accepts: &str) -> Option<Response> {
     // `make ui` precompresses the wasm and js next to the originals.
     for (coding, suffix) in encodings(accepts) {
         if let Some(bytes) = read_confined(dir, &format!("{rel}{suffix}")).await {
-            return Some(
-                (
-                    [
-                        (header::CONTENT_TYPE, content_type(rel)),
-                        (header::CACHE_CONTROL, cache_control(rel)),
-                        (header::CONTENT_ENCODING, coding),
-                        (header::VARY, "Accept-Encoding"),
-                    ],
-                    bytes,
-                )
-                    .into_response(),
-            );
+            let mut resp = (
+                [
+                    (header::CONTENT_TYPE, content_type(rel)),
+                    (header::CACHE_CONTROL, cache_control(rel)),
+                    (header::CONTENT_ENCODING, coding),
+                    (header::VARY, "Accept-Encoding"),
+                ],
+                bytes,
+            )
+                .into_response();
+            // For the page's progress bar: it counts decoded bytes, which
+            // Content-Length of a compressed file says nothing about.
+            if let Ok(meta) = tokio::fs::metadata(std::path::Path::new(dir).join(rel)).await {
+                resp.headers_mut().insert("x-decoded-length", meta.len().into());
+            }
+            return Some(resp);
         }
     }
     let bytes = read_confined(dir, rel).await?;
