@@ -36,7 +36,7 @@ sha2 = "0.10"
 # Verify the ed25519 signature on a self-update. ring is already in the tree via
 # rustls, so this adds no new dependency; it builds for every agent target.
 ring = "0.17"
-base64 = "0.22"
+base64 = "0.23"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
