@@ -182,10 +182,12 @@ fn apply_palette(ctx: &egui::Context, p: Palette) {
     ctx.set_visuals(v);
 }
 
-/// Install Inter (proportional) + JetBrains Mono (monospace) and set text sizes.
+/// Install IBM Plex Sans (proportional) + JetBrains Mono (monospace) and set text
+/// sizes. Each stands in for glyphs the other lacks; both cover Cyrillic. There is
+/// no emoji face: a terminal shows a box for an emoji.
 /// Call once at startup.
 pub fn install_fonts(ctx: &egui::Context) {
-    let mut fonts = egui::FontDefinitions::default();
+    let mut fonts = egui::FontDefinitions::empty();
     fonts.font_data.insert(
         "plex".to_owned(),
         egui::FontData::from_static(include_bytes!("../assets/IBMPlexSans-Regular.ttf")),
@@ -198,22 +200,13 @@ pub fn install_fonts(ctx: &egui::Context) {
         "jbmono".to_owned(),
         egui::FontData::from_static(include_bytes!("../assets/JetBrainsMono-Regular.ttf")),
     );
-    fonts
-        .families
-        .entry(FontFamily::Proportional)
-        .or_default()
-        .insert(0, "plex".to_owned());
-    // Falls back to the proportional stack for glyphs the face lacks.
-    let fallback = fonts.families[&FontFamily::Proportional].clone();
-    fonts.families.insert(
-        FontFamily::Name("semibold".into()),
-        std::iter::once("plex-semibold".to_owned()).chain(fallback).collect(),
-    );
-    fonts
-        .families
-        .entry(FontFamily::Monospace)
-        .or_default()
-        .insert(0, "jbmono".to_owned());
+    for (family, faces) in [
+        (FontFamily::Proportional, ["plex", "jbmono"]),
+        (FontFamily::Monospace, ["jbmono", "plex"]),
+        (FontFamily::Name("semibold".into()), ["plex-semibold", "jbmono"]),
+    ] {
+        fonts.families.insert(family, faces.map(str::to_owned).to_vec());
+    }
     ctx.set_fonts(fonts);
 
     ctx.style_mut(|s| {

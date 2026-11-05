@@ -58,11 +58,15 @@ test:
 # Build + push the relay image. linux/amd64 for the k8s nodes; buildkit registry
 # exporter. After this, roll out the relay Deployment in your cluster.
 # Build the egui/WASM UI bundle into crates/ui/dist (served by the relay from
-# RUSTLITEL_UI_DIR). Needs: `rustup target add wasm32-unknown-unknown` and `trunk`
-# (brew install trunk). The relay compiles without it; the image needs it.
+# RUSTLITEL_UI_DIR). Needs: `rustup target add wasm32-unknown-unknown`, `trunk` and
+# `brotli` (brew install trunk brotli). The relay compiles without it; the image needs it.
 .PHONY: ui
 ui:
-	cd crates/ui && trunk build --release
+	cd crates/ui && trunk build --release --cargo-profile ui
+	@# The relay serves these to browsers that accept them; 3 MB of wasm takes seconds.
+	for f in crates/ui/dist/*.wasm crates/ui/dist/*.js; do \
+	  brotli -f -q 11 -k "$$f" && gzip -f -9 -k "$$f" || exit 1; \
+	done
 	@echo "-> crates/ui/dist"
 
 # RUSTLITEL_BUILD_ID (git short SHA) is baked into the relay + agent so the agent's

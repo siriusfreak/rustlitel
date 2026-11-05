@@ -21,3 +21,13 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 futures-util = "0.3"
 tokio = { version = "1", features = ["full"] }
+
+# The web UI is downloaded on every new build, so it is built for size. A profile
+# of its own: the relay and agents stay on the plain release profile.
+[profile.ui]
+inherits = "release"
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

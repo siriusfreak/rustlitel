@@ -9,28 +9,84 @@
 use std::sync::Arc;
 
 use axum::extract::State;
-use axum::http::{header, StatusCode, Uri};
+use axum::http::{header, HeaderMap, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 
 use crate::state::AppState;
 
-pub async fn serve(State(state): State<Arc<AppState>>, uri: Uri) -> Response {
+pub async fn serve(State(state): State<Arc<AppState>>, uri: Uri, headers: HeaderMap) -> Response {
+    let accepts = headers
+        .get(header::ACCEPT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
     let rel = uri.path().trim_start_matches('/');
     let rel = if rel.is_empty() { "index.html" } else { rel };
     // The bundle is flat and predictable; refuse anything trying to climb out.
     if rel.contains("..") {
         return StatusCode::BAD_REQUEST.into_response();
     }
-    if let Some(resp) = read_file(&state.ui_dir, rel).await {
+    if let Some(resp) = read_file(&state.ui_dir, rel, accepts).await {
         return resp;
     }
-    match read_file(&state.ui_dir, "index.html").await {
+    match read_file(&state.ui_dir, "index.html", accepts).await {
         Some(resp) => resp,
         None => (StatusCode::NOT_FOUND, "UI bundle not available").into_response(),
     }
 }
 
-async fn read_file(dir: &str, rel: &str) -> Option<Response> {
+async fn read_file(dir: &str, rel: &str, accepts: &str) -> Option<Response> {
+    // `make ui` precompresses the wasm and js next to the originals.
+    for (coding, suffix) in encodings(accepts) {
+        if let Some(bytes) = read_confined(dir, &format!("{rel}{suffix}")).await {
+            return Some(
+                (
+                    [
+                        (header::CONTENT_TYPE, content_type(rel)),
+                        (header::CACHE_CONTROL, cache_control(rel)),
+                        (header::CONTENT_ENCODING, coding),
+                        (header::VARY, "Accept-Encoding"),
+                    ],
+                    bytes,
+                )
+                    .into_response(),
+            );
+        }
+    }
+    let bytes = read_confined(dir, rel).await?;
+    Some(
+        (
+            [
+                (header::CONTENT_TYPE, content_type(rel)),
+                (header::CACHE_CONTROL, cache_control(rel)),
+                (header::VARY, "Accept-Encoding"),
+            ],
+            bytes,
+        )
+            .into_response(),
+    )
+}
+
+/// Which precompressed variants the browser takes, best first, as
+/// (Content-Encoding, file suffix).
+fn encodings(accepts: &str) -> Vec<(&'static str, &'static str)> {
+    let takes = |name: &str| {
+        accepts.split(',').any(|item| {
+            let mut parts = item.split(';');
+            parts.next().is_some_and(|c| c.trim() == name)
+                && !parts.any(|p| matches!(p.trim(), "q=0" | "q=0.0" | "q=0.00" | "q=0.000"))
+        })
+    };
+    let mut out = Vec::new();
+    if takes("br") {
+        out.push(("br", ".br"));
+    }
+    if takes("gzip") {
+        out.push(("gzip", ".gz"));
+    }
+    out
+}
+
+async fn read_confined(dir: &str, rel: &str) -> Option<Vec<u8>> {
     let path = std::path::Path::new(dir).join(rel);
     // Confine to the bundle dir: resolve symlinks/`..` and require the result to
     // stay under the (canonicalised) UI dir, so a traversal or an escaping
@@ -40,17 +96,7 @@ async fn read_file(dir: &str, rel: &str) -> Option<Response> {
     if !real.starts_with(&base) {
         return None;
     }
-    let bytes = tokio::fs::read(&real).await.ok()?;
-    Some(
-        (
-            [
-                (header::CONTENT_TYPE, content_type(rel)),
-                (header::CACHE_CONTROL, cache_control(rel)),
-            ],
-            bytes,
-        )
-            .into_response(),
-    )
+    tokio::fs::read(&real).await.ok()
 }
 
 /// Caching policy. `index.html` must always be revalidated so a deploy's new
@@ -96,5 +142,19 @@ fn content_type(path: &str) -> &'static str {
         "ico" => "image/x-icon",
         "woff2" => "font/woff2",
         _ => "application/octet-stream",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::encodings;
+
+    #[test]
+    fn picks_what_the_browser_takes() {
+        assert_eq!(encodings("gzip, deflate, br"), [("br", ".br"), ("gzip", ".gz")]);
+        assert_eq!(encodings("gzip"), [("gzip", ".gz")]);
+        assert_eq!(encodings("br;q=0, gzip;q=0.5"), [("gzip", ".gz")]);
+        assert!(encodings("").is_empty());
+        assert!(encodings("identity").is_empty());
     }
 }

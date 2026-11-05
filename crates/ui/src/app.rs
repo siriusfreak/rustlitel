@@ -419,7 +419,7 @@ impl RustlitelApp {
             .exact_height(44.0)
             .frame(egui::Frame::none().fill(p.card).inner_margin(Margin::symmetric(14.0, 0.0)).stroke(Stroke::new(1.0_f32, p.border)))
             .show(ctx, |ui| {
-                ui.horizontal_centered(|ui| {
+                row(ui, 44.0, |ui| {
                     logo(ui, &p, 20.0);
                     ui.label(RichText::new("rustlitel").font(theme::semibold(15.0)).color(p.text));
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -1055,6 +1055,10 @@ fn segmented(ui: &mut egui::Ui, labels: &[&str], on: usize) -> Option<usize> {
         .inner_margin(Margin::same(2.0))
         .show(ui, |ui| {
             ui.spacing_mut().item_spacing.x = 2.0;
+            // The height comes from min_size alone, so the control fits a row of
+            // 30 and does not push its neighbours off the line.
+            ui.spacing_mut().button_padding.y = 0.0;
+            ui.spacing_mut().interact_size.y = height;
             ui.horizontal(|ui| {
                 let reversed = ui.layout().main_dir() == egui::Direction::RightToLeft;
                 let mut order: Vec<usize> = (0..labels.len()).collect();
