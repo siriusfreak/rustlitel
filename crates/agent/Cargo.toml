@@ -11,7 +11,7 @@ path = "src/main.rs"
 [dependencies]
 rustlitel-proto = { path = "../proto" }
 tokio = { workspace = true }
-tokio-tungstenite = { version = "0.23", features = ["rustls-tls-webpki-roots"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 futures-util = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
