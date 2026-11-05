@@ -1,6 +1,6 @@
-//! Theme: dark / light / system preference, the egui visuals for each (built to
-//! match the approved design mockup), and font installation (Inter for the UI,
-//! JetBrains Mono for the terminal).
+//! Theme: dark / light / system preference, the egui visuals for each, and font
+//! installation (IBM Plex Sans for the UI, JetBrains Mono for machine names and
+//! the terminal). Colours follow the "Консоль rustlitel" design canvas.
 
 use egui::{Color32, FontFamily};
 use serde::{Deserialize, Serialize};
@@ -44,64 +44,76 @@ impl ThemePref {
 
 // --- palette ----------------------------------------------------------------
 
-/// Semantic + surface colours for one mode. Mirrors the design tokens used in
-/// the mockup so the egui build reads the same.
+/// Semantic + surface colours for one mode.
 #[derive(Clone, Copy)]
 pub struct Palette {
     pub page: Color32,
     pub card: Color32,
     pub hover: Color32,
     pub active: Color32,
+    pub selected: Color32,
     pub border: Color32,
     pub border_strong: Color32,
     pub text: Color32,
     pub text_secondary: Color32,
     pub text_muted: Color32,
+    /// Fill of the primary button, the logo and the cursor.
     pub accent: Color32,
-    pub accent_muted: Color32,
+    /// Accent as text on this mode's surfaces (amber is unreadable on white).
+    pub accent_text: Color32,
+    /// Text on an accent fill.
+    pub on_accent: Color32,
     pub success: Color32,
     pub danger: Color32,
     pub warning: Color32,
 }
 
 pub const DARK: Palette = Palette {
-    page: Color32::from_rgb(0x0e, 0x0f, 0x13),
-    card: Color32::from_rgb(0x16, 0x18, 0x1f),
-    hover: Color32::from_rgb(0x1d, 0x20, 0x29),
-    active: Color32::from_rgb(0x24, 0x28, 0x33),
-    border: Color32::from_rgb(0x2a, 0x2e, 0x38),
-    border_strong: Color32::from_rgb(0x3a, 0x40, 0x4d),
-    text: Color32::from_rgb(0xe6, 0xe8, 0xec),
-    text_secondary: Color32::from_rgb(0x9a, 0xa3, 0xb2),
-    text_muted: Color32::from_rgb(0x6b, 0x72, 0x80),
-    accent: Color32::from_rgb(0x4f, 0x8c, 0xff),
-    accent_muted: Color32::from_rgb(0x1a, 0x2a, 0x4a),
-    success: Color32::from_rgb(0x30, 0xc8, 0x6a),
-    danger: Color32::from_rgb(0xef, 0x53, 0x50),
-    warning: Color32::from_rgb(0xf5, 0x9e, 0x0b),
+    page: Color32::from_rgb(0x11, 0x15, 0x1c),
+    card: Color32::from_rgb(0x17, 0x1c, 0x25),
+    hover: Color32::from_rgb(0x1f, 0x26, 0x31),
+    active: Color32::from_rgb(0x28, 0x30, 0x3d),
+    selected: Color32::from_rgb(0x2a, 0x2a, 0x22),
+    border: Color32::from_rgb(0x2b, 0x33, 0x40),
+    border_strong: Color32::from_rgb(0x3d, 0x47, 0x57),
+    text: Color32::from_rgb(0xe8, 0xe6, 0xe1),
+    text_secondary: Color32::from_rgb(0xa3, 0xa9, 0xb3),
+    text_muted: Color32::from_rgb(0x85, 0x8d, 0x9a),
+    accent: Color32::from_rgb(0xf0, 0xa8, 0x3a),
+    accent_text: Color32::from_rgb(0xf0, 0xa8, 0x3a),
+    on_accent: Color32::from_rgb(0x1a, 0x12, 0x04),
+    success: Color32::from_rgb(0x4c, 0xc3, 0x8a),
+    danger: Color32::from_rgb(0xf2, 0x70, 0x6a),
+    warning: Color32::from_rgb(0xe3, 0xc0, 0x4b),
 };
 
 pub const LIGHT: Palette = Palette {
-    page: Color32::from_rgb(0xf3, 0xf4, 0xf6),
+    page: Color32::from_rgb(0xee, 0xf0, 0xf2),
     card: Color32::from_rgb(0xff, 0xff, 0xff),
-    hover: Color32::from_rgb(0xec, 0xee, 0xf2),
-    active: Color32::from_rgb(0xe2, 0xe6, 0xee),
-    border: Color32::from_rgb(0xe1, 0xe4, 0xea),
-    border_strong: Color32::from_rgb(0xcd, 0xd2, 0xdb),
-    text: Color32::from_rgb(0x1f, 0x23, 0x28),
-    text_secondary: Color32::from_rgb(0x56, 0x5e, 0x6c),
-    text_muted: Color32::from_rgb(0x8c, 0x93, 0xa1),
-    accent: Color32::from_rgb(0x25, 0x63, 0xeb),
-    accent_muted: Color32::from_rgb(0xe3, 0xec, 0xfd),
-    success: Color32::from_rgb(0x16, 0xa3, 0x4a),
-    danger: Color32::from_rgb(0xdc, 0x35, 0x35),
-    warning: Color32::from_rgb(0xb4, 0x6a, 0x0a),
+    hover: Color32::from_rgb(0xe5, 0xe8, 0xec),
+    active: Color32::from_rgb(0xd9, 0xdd, 0xe3),
+    selected: Color32::from_rgb(0xfb, 0xf0, 0xdc),
+    border: Color32::from_rgb(0xd3, 0xd8, 0xde),
+    border_strong: Color32::from_rgb(0xb4, 0xbb, 0xc4),
+    text: Color32::from_rgb(0x1b, 0x20, 0x27),
+    text_secondary: Color32::from_rgb(0x4d, 0x55, 0x60),
+    text_muted: Color32::from_rgb(0x66, 0x70, 0x7c),
+    accent: Color32::from_rgb(0xf0, 0xa8, 0x3a),
+    accent_text: Color32::from_rgb(0x8f, 0x51, 0x00),
+    on_accent: Color32::from_rgb(0x1a, 0x12, 0x04),
+    success: Color32::from_rgb(0x12, 0x80, 0x4f),
+    danger: Color32::from_rgb(0xc8, 0x32, 0x2b),
+    warning: Color32::from_rgb(0x8a, 0x62, 0x00),
 };
 
-/// The terminal surface is always dark (as in the mockup), in both modes.
-/// Kept clearly darker than the page so the terminal reads as a distinct inset.
-pub const TERM_BG: Color32 = Color32::from_rgb(0x05, 0x06, 0x09);
-pub const TERM_FG: Color32 = Color32::from_rgb(0xd7, 0xdd, 0xe6);
+/// The terminal surface is dark in both modes.
+pub const TERM_BG: Color32 = Color32::from_rgb(0x0b, 0x0e, 0x13);
+pub const TERM_FG: Color32 = Color32::from_rgb(0xd9, 0xdc, 0xe1);
+
+/// The UI's semibold face at `size`.
+pub fn semibold(size: f32) -> egui::FontId {
+    egui::FontId::new(size, FontFamily::Name("semibold".into()))
+}
 
 /// Resolve the current palette from the applied visuals (dark vs light).
 pub fn current(ctx: &egui::Context) -> Palette {
@@ -124,47 +136,46 @@ fn apply_palette(ctx: &egui::Context, p: Palette) {
     v.panel_fill = p.page;
     v.window_fill = p.card;
     v.faint_bg_color = p.hover;
-    v.extreme_bg_color = p.card;
-    v.override_text_color = Some(p.text);
-    v.hyperlink_color = p.accent;
+    v.extreme_bg_color = p.page;
+    v.hyperlink_color = p.accent_text;
     v.selection.bg_fill = p.accent.linear_multiply(if dark { 0.35 } else { 0.25 });
     v.selection.stroke = egui::Stroke::new(1.0_f32,p.accent);
-    v.window_stroke = egui::Stroke::new(0.5_f32,p.border);
+    v.window_stroke = egui::Stroke::new(1.0_f32, p.border);
     v.popup_shadow = egui::epaint::Shadow::NONE;
     v.window_shadow = egui::epaint::Shadow::NONE;
 
-    let rounding = egui::Rounding::same(7.0);
+    let rounding = egui::Rounding::same(6.0);
     let w = &mut v.widgets;
     w.noninteractive.bg_fill = p.card;
     w.noninteractive.weak_bg_fill = p.card;
-    w.noninteractive.bg_stroke = egui::Stroke::new(0.5_f32,p.border);
+    w.noninteractive.bg_stroke = egui::Stroke::new(1.0_f32, p.border);
     w.noninteractive.fg_stroke = egui::Stroke::new(1.0_f32,p.text_secondary);
     w.noninteractive.rounding = rounding;
 
     w.inactive.bg_fill = p.card;
     w.inactive.weak_bg_fill = p.card;
-    w.inactive.bg_stroke = egui::Stroke::new(0.5_f32,p.border);
+    w.inactive.bg_stroke = egui::Stroke::new(1.0_f32, p.border);
     w.inactive.fg_stroke = egui::Stroke::new(1.0_f32,p.text);
     w.inactive.rounding = rounding;
     w.inactive.expansion = 0.0;
 
     w.hovered.bg_fill = p.hover;
     w.hovered.weak_bg_fill = p.hover;
-    w.hovered.bg_stroke = egui::Stroke::new(0.5_f32,p.border_strong);
+    w.hovered.bg_stroke = egui::Stroke::new(1.0_f32, p.border_strong);
     w.hovered.fg_stroke = egui::Stroke::new(1.0_f32,p.text);
     w.hovered.rounding = rounding;
     w.hovered.expansion = 0.0;
 
     w.active.bg_fill = p.active;
     w.active.weak_bg_fill = p.active;
-    w.active.bg_stroke = egui::Stroke::new(0.5_f32,p.accent);
+    w.active.bg_stroke = egui::Stroke::new(1.0_f32, p.accent);
     w.active.fg_stroke = egui::Stroke::new(1.0_f32,p.text);
     w.active.rounding = rounding;
     w.active.expansion = 0.0;
 
     w.open.bg_fill = p.hover;
     w.open.weak_bg_fill = p.hover;
-    w.open.bg_stroke = egui::Stroke::new(0.5_f32,p.border);
+    w.open.bg_stroke = egui::Stroke::new(1.0_f32, p.border);
     w.open.fg_stroke = egui::Stroke::new(1.0_f32,p.text);
     w.open.rounding = rounding;
 
@@ -176,8 +187,12 @@ fn apply_palette(ctx: &egui::Context, p: Palette) {
 pub fn install_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
     fonts.font_data.insert(
-        "inter".to_owned(),
-        egui::FontData::from_static(include_bytes!("../assets/Inter.ttf")),
+        "plex".to_owned(),
+        egui::FontData::from_static(include_bytes!("../assets/IBMPlexSans-Regular.ttf")),
+    );
+    fonts.font_data.insert(
+        "plex-semibold".to_owned(),
+        egui::FontData::from_static(include_bytes!("../assets/IBMPlexSans-SemiBold.ttf")),
     );
     fonts.font_data.insert(
         "jbmono".to_owned(),
@@ -187,7 +202,13 @@ pub fn install_fonts(ctx: &egui::Context) {
         .families
         .entry(FontFamily::Proportional)
         .or_default()
-        .insert(0, "inter".to_owned());
+        .insert(0, "plex".to_owned());
+    // Falls back to the proportional stack for glyphs the face lacks.
+    let fallback = fonts.families[&FontFamily::Proportional].clone();
+    fonts.families.insert(
+        FontFamily::Name("semibold".into()),
+        std::iter::once("plex-semibold".to_owned()).chain(fallback).collect(),
+    );
     fonts
         .families
         .entry(FontFamily::Monospace)
@@ -200,12 +221,12 @@ pub fn install_fonts(ctx: &egui::Context) {
         s.text_styles = [
             (TextStyle::Heading, FontId::new(18.0, Proportional)),
             (TextStyle::Body, FontId::new(14.0, Proportional)),
-            (TextStyle::Button, FontId::new(13.5, Proportional)),
+            (TextStyle::Button, FontId::new(13.0, Proportional)),
             (TextStyle::Small, FontId::new(12.0, Proportional)),
             (TextStyle::Monospace, FontId::new(13.0, Monospace)),
         ]
         .into();
-        s.spacing.button_padding = egui::vec2(10.0, 5.0);
+        s.spacing.button_padding = egui::vec2(12.0, 6.0);
         s.spacing.item_spacing = egui::vec2(8.0, 6.0);
     });
 }

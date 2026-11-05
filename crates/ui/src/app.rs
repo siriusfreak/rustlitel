@@ -1,14 +1,14 @@
-//! The rustlitel egui application: auth, agent list, terminal, exec, installer
-//! links, downloads, self-delete, and the theme switch. Styled to match the
-//! approved design mockup.
+//! The rustlitel egui application: sign-in, the machine list, terminal, run
+//! command, the add-a-machine dialog, uninstall, and the theme switch. Laid out
+//! after the "Консоль rustlitel" design canvas.
 
 use std::sync::{Arc, Mutex};
 
-use egui::{vec2, Align, Color32, FontId, Layout, Margin, Rect, RichText, Rounding, Sense, Stroke};
+use egui::{vec2, Align, Color32, FontId, Layout, Margin, RichText, Rounding, Sense, Stroke};
 use serde::Deserialize;
 
 use crate::mobile;
-use crate::term::Terminal;
+use crate::term::{self, Terminal};
 use crate::theme::{self, Palette, ThemePref};
 
 // --- JSON shapes the relay returns -----------------------------------------
@@ -80,6 +80,7 @@ pub struct RustlitelApp {
 
     inbox: Inbox,
     auth: Auth,
+    me_requested: bool,
     oidc_enabled: bool,
 
     login_token: String,
@@ -91,12 +92,15 @@ pub struct RustlitelApp {
     agents_loading: bool,
     last_agents_fetch: f64,
     selected: Option<String>,
+    filter: String,
     /// Narrow screen: the agent list replaces the selected agent's view.
     show_agents: bool,
 
     tab: CentralTab,
     term: Option<Terminal>,
     term_shell: String,
+    /// Room the terminal grid has, measured while it is drawn or about to be.
+    term_area: egui::Vec2,
 
     exec_cmd: String,
     exec_shell: String,
@@ -104,11 +108,13 @@ pub struct RustlitelApp {
     exec_busy: bool,
     exec_result: Option<Result<ExecResp, String>>,
 
+    show_add: bool,
     inst_os: String,
     inst_name: String,
     inst_busy: bool,
     inst_link: Option<InstallerLink>,
     inst_error: Option<String>,
+    inst_copied: bool,
 
     confirm_uninstall: Option<String>,
     note: Option<String>,
@@ -129,6 +135,7 @@ impl RustlitelApp {
             applied_dark: None,
             inbox: Arc::new(Mutex::new(Vec::new())),
             auth: Auth::Unknown,
+            me_requested: false,
             oidc_enabled: false,
             login_token: String::new(),
             login_busy: false,
@@ -138,20 +145,24 @@ impl RustlitelApp {
             agents_loading: false,
             last_agents_fetch: 0.0,
             selected: None,
+            filter: String::new(),
             show_agents: false,
             tab: CentralTab::Terminal,
             term: None,
             term_shell: String::new(),
+            term_area: vec2(640.0, 384.0),
             exec_cmd: String::new(),
             exec_shell: String::new(),
             exec_timeout: String::new(),
             exec_busy: false,
             exec_result: None,
+            show_add: false,
             inst_os: "windows".to_string(),
             inst_name: String::new(),
             inst_busy: false,
             inst_link: None,
             inst_error: None,
+            inst_copied: false,
             confirm_uninstall: None,
             note: None,
         }
@@ -178,7 +189,7 @@ impl RustlitelApp {
         ehttp::fetch(req, move |res| {
             let msg = match res {
                 Ok(r) if r.ok => Msg::LoginOk,
-                Ok(r) if r.status == 401 => Msg::LoginErr("That token wasn't accepted.".to_string()),
+                Ok(r) if r.status == 401 => Msg::LoginErr("That token was not accepted. Check it and try again.".to_string()),
                 Ok(r) => Msg::LoginErr(format!("Login failed (HTTP {}).", r.status)),
                 Err(e) => Msg::LoginErr(e),
             };
@@ -258,6 +269,7 @@ impl RustlitelApp {
         self.term = None;
         self.exec_result = None;
         self.inst_link = None;
+        self.show_add = false;
     }
 
     // --- inbox ---
@@ -315,7 +327,7 @@ impl RustlitelApp {
                     self.inst_error = Some(e);
                 }
                 Msg::Uninstalled(Ok(())) => {
-                    self.note = Some("Uninstall requested — the agent will drop off shortly.".into());
+                    self.note = Some("Uninstall sent. The machine will leave the list shortly.".into());
                 }
                 Msg::Uninstalled(Err(e)) => {
                     self.note = Some(format!("Uninstall failed: {e}"));
@@ -332,228 +344,177 @@ impl RustlitelApp {
         }
     }
 
-    // --- shared widgets ---
-
-    fn theme_segmented(&mut self, ui: &mut egui::Ui, reversed: bool) {
-        let p = theme::current(ui.ctx());
-        // A right-aligned (right_to_left) parent flips the visual order, so the
-        // header pre-reverses to keep the on-screen reading System · Light · Dark.
-        let order = if reversed {
-            [ThemePref::Dark, ThemePref::Light, ThemePref::System]
-        } else {
-            ThemePref::ALL
-        };
-        egui::Frame::none()
-            .stroke(Stroke::new(0.5_f32,p.border))
-            .rounding(6.0)
-            .inner_margin(Margin::same(1.0))
-            .show(ui, |ui| {
-                ui.spacing_mut().item_spacing.x = 0.0;
-                ui.horizontal(|ui| {
-                    for t in order {
-                        let on = self.theme == t;
-                        let txt = RichText::new(t.label())
-                            .size(12.0)
-                            .color(if on { p.accent } else { p.text_secondary });
-                        let btn = egui::Button::new(txt)
-                            .fill(if on { p.accent_muted } else { Color32::TRANSPARENT })
-                            .stroke(Stroke::NONE)
-                            .rounding(5.0)
-                            .min_size(vec2(46.0, 20.0));
-                        if ui.add(btn).clicked() {
-                            self.theme = t;
-                        }
-                    }
-                });
-            });
+    fn modal_open(&self) -> bool {
+        self.show_add || self.confirm_uninstall.is_some()
     }
 
-    // --- login ---
+    // --- sign in ---
 
     fn ui_login(&mut self, ctx: &egui::Context) {
         let p = theme::current(ctx);
         egui::CentralPanel::default().show(ctx, |ui| {
+            let width = 340.0_f32.min(ui.available_width() - 32.0);
+            ui.add_space((ui.available_height() * 0.32 - 40.0).max(24.0));
             ui.vertical_centered(|ui| {
-                ui.add_space(ui.available_height() * 0.18);
-                let (rect, _) = ui.allocate_exact_size(vec2(44.0, 44.0), Sense::hover());
-                ui.painter().rect_filled(rect, Rounding::same(12.0), p.accent);
-                ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, ">_", FontId::monospace(22.0), Color32::WHITE);
-                ui.add_space(8.0);
-                ui.label(RichText::new("rustlitel").size(24.0).strong().color(p.text));
-                ui.add_space(2.0);
-                ui.label(RichText::new("remote shell relay").size(13.0).color(p.text_muted));
-                ui.add_space(20.0);
-
-                egui::Frame::none()
-                    .fill(p.card)
-                    .stroke(Stroke::new(0.5_f32,p.border))
-                    .rounding(12.0)
-                    .inner_margin(Margin::same(20.0))
-                    .show(ui, |ui| {
-                        ui.set_width(320.0_f32.min(ui.ctx().screen_rect().width() - 72.0));
-                        ui.vertical_centered_justified(|ui| {
-                            // With Keycloak configured, that's the only web
-                            // login — the operator token stays a CLI/script
-                            // credential (Bearer), not shown here.
-                            if self.oidc_enabled {
-                                let b = egui::Button::new(
-                                    RichText::new("Sign in with Keycloak").color(Color32::WHITE),
-                                )
-                                .fill(p.accent)
-                                .min_size(vec2(0.0, 36.0));
-                                if ui.add(b).clicked() {
-                                    navigate(&self.url("/oauth2/login?rd=/"));
-                                }
-                                return;
-                            }
-
-                            ui.with_layout(Layout::left_to_right(Align::Min), |ui| {
-                                ui.label(RichText::new("Operator token").size(13.0).color(p.text_secondary));
-                            });
-                            ui.add_space(6.0);
-                            let field = ui.add(
-                                egui::TextEdit::singleline(&mut self.login_token)
-                                    .password(true)
-                                    .hint_text("paste operator token")
-                                    .margin(Margin::symmetric(10.0, 7.0))
-                                    .desired_width(f32::INFINITY),
-                            );
-                            mobile::text_target(field.rect);
-                            ui.add_space(8.0);
-                            let submit = (field.lost_focus()
-                                && ui.input(|i| i.key_pressed(egui::Key::Enter)))
-                                || ui
-                                    .add(
-                                        egui::Button::new(RichText::new("Log in").color(Color32::WHITE))
-                                            .fill(p.accent)
-                                            .min_size(vec2(0.0, 32.0)),
-                                    )
-                                    .clicked();
-                            if submit && !self.login_busy && !self.login_token.is_empty() {
-                                self.do_login(ctx);
-                            }
-                            if self.login_busy {
-                                ui.add_space(8.0);
-                                ui.horizontal(|ui| {
-                                    ui.spinner();
-                                    ui.label(RichText::new("signing in…").color(p.text_secondary));
-                                });
-                            }
-                            if let Some(err) = &self.login_error {
-                                ui.add_space(8.0);
-                                ui.label(RichText::new(err).size(13.0).color(p.danger));
-                            }
-                        });
+                ui.allocate_ui_with_layout(vec2(width, 0.0), Layout::top_down_justified(Align::Min), |ui| {
+                    ui.horizontal(|ui| {
+                        logo(ui, &p, 28.0);
+                        ui.label(RichText::new("rustlitel").font(theme::semibold(20.0)).color(p.text));
                     });
+                    ui.add_space(10.0);
+                    ui.label(RichText::new("Shells on your machines behind NAT. Sign in to see which ones are connected.").size(14.0).color(p.text_secondary));
+                    ui.add_space(12.0);
 
-                ui.add_space(16.0);
-                ui.allocate_ui_with_layout(vec2(160.0, 26.0), Layout::top_down(Align::Center), |ui| {
-                    self.theme_segmented(ui, false);
+                    // With Keycloak configured, that's the only web login: the
+                    // operator token stays a CLI/script credential.
+                    if self.oidc_enabled {
+                        if ui.add(primary("Sign in with Keycloak", 40.0)).clicked() {
+                            navigate(&self.url("/oauth2/login?rd=/"));
+                        }
+                    } else {
+                        ui.label(RichText::new("Operator token").size(12.0).color(p.text_secondary));
+                        let field = ui.add(
+                            egui::TextEdit::singleline(&mut self.login_token)
+                                .password(true)
+                                .hint_text("Paste the operator token")
+                                .margin(Margin::symmetric(10.0, 9.0))
+                                .desired_width(f32::INFINITY),
+                        );
+                        mobile::text_target(field.rect);
+                        ui.add_space(4.0);
+                        let submit = (field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
+                            | ui.add(primary("Sign in", 40.0)).clicked();
+                        if submit && !self.login_busy && !self.login_token.is_empty() {
+                            self.do_login(ctx);
+                        }
+                    }
+                    if self.login_busy {
+                        ui.add(egui::Spinner::new().size(16.0));
+                    }
+                    if let Some(err) = &self.login_error {
+                        ui.label(RichText::new(err).size(13.0).color(p.danger));
+                    }
+                    ui.add_space(8.0);
+                    ui.label(RichText::new("You stay signed in on this device for 30 days.").size(12.0).color(p.text_muted));
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| self.theme_switch(ui));
                 });
             });
         });
     }
 
-    // --- header ---
+    fn theme_switch(&mut self, ui: &mut egui::Ui) {
+        let labels = ThemePref::ALL.map(|t| t.label());
+        let on = ThemePref::ALL.iter().position(|t| *t == self.theme).unwrap_or(0);
+        if let Some(i) = segmented(ui, &labels, on) {
+            self.theme = ThemePref::ALL[i];
+        }
+    }
+
+    // --- top bar ---
 
     fn ui_header(&mut self, ctx: &egui::Context) {
         let p = theme::current(ctx);
         egui::TopBottomPanel::top("header")
-            .frame(
-                egui::Frame::none()
-                    .fill(p.card)
-                    .inner_margin(Margin::symmetric(14.0, 8.0))
-                    .stroke(Stroke::new(0.5_f32,p.border)),
-            )
+            .exact_height(44.0)
+            .frame(egui::Frame::none().fill(p.card).inner_margin(Margin::symmetric(14.0, 0.0)).stroke(Stroke::new(1.0_f32, p.border)))
             .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    wordmark(ui, &p, 16.0);
+                ui.horizontal_centered(|ui| {
+                    logo(ui, &p, 20.0);
+                    ui.label(RichText::new("rustlitel").font(theme::semibold(15.0)).color(p.text));
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        // logout
-                        if ui
-                            .add(egui::Button::new(RichText::new("Log out").size(12.5).color(p.text_secondary)).fill(Color32::TRANSPARENT).stroke(Stroke::new(0.5_f32,p.border)))
-                            .clicked()
-                        {
+                        if ui.add(plain("Log out", &p)).clicked() {
                             self.do_logout(ctx);
                         }
-                        ui.add_space(4.0);
-                        if let Auth::Authed { username: Some(u), .. } = &self.auth {
-                            user_chip(ui, &p, u);
-                            ui.add_space(6.0);
+                        if let Auth::Authed { username: Some(u) } = &self.auth {
+                            ui.label(RichText::new(u).size(13.0).color(p.text_secondary));
                         }
-                        if !is_narrow(ui.ctx()) {
-                            self.theme_segmented(ui, true);
+                        if !is_narrow(ctx) {
+                            self.theme_switch(ui);
                         }
                     });
                 });
             });
     }
 
-    // --- sidebar ---
+    // --- machine list ---
 
     fn ui_side(&mut self, ctx: &egui::Context) {
         let p = theme::current(ctx);
         egui::SidePanel::left("agents")
             .resizable(false)
-            .exact_width(222.0)
-            .frame(
-                egui::Frame::none()
-                    .fill(p.card)
-                    .inner_margin(Margin::symmetric(10.0, 10.0))
-                    .stroke(Stroke::new(0.5_f32,p.border)),
-            )
+            .exact_width(248.0)
+            .frame(egui::Frame::none().fill(p.card).inner_margin(Margin::same(12.0)).stroke(Stroke::new(1.0_f32, p.border)))
             .show(ctx, |ui| self.ui_agents(ui, &p));
     }
 
     fn ui_agents(&mut self, ui: &mut egui::Ui, p: &Palette) {
-        let ctx = ui.ctx().clone();
-        let ctx = &ctx;
-        {
-            {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("Agents").size(13.0).strong().color(p.text_secondary));
-                    ui.label(RichText::new(format!("· {}", self.agents.len())).size(13.0).color(p.text_muted));
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui
-                            .add(egui::Button::new(RichText::new("Refresh").size(11.5).color(p.text_secondary)).fill(Color32::TRANSPARENT).stroke(Stroke::NONE))
-                            .clicked()
-                        {
-                            self.fetch_agents(ctx);
-                        }
-                        if self.agents_loading {
-                            ui.add(egui::Spinner::new().size(13.0));
-                        }
-                    });
+        egui::TopBottomPanel::bottom("add_machine_bar")
+            .exact_height(control_height() + 12.0)
+            .frame(egui::Frame::none().inner_margin(Margin { top: 10.0, bottom: 2.0, ..Margin::ZERO }))
+            .show_separator_line(false)
+            .show_inside(ui, |ui| {
+                ui.vertical_centered_justified(|ui| {
+                    if ui.add(ghost("Add machine", p).min_size(vec2(0.0, control_height()))).clicked() {
+                        self.show_add = true;
+                    }
                 });
-                ui.add_space(4.0);
+            });
 
-                if let Some(err) = &self.agents_error {
-                    ui.label(RichText::new(err).size(12.0).color(p.danger));
-                }
-                ui.separator();
+        let filter = ui.add(
+            egui::TextEdit::singleline(&mut self.filter)
+                .hint_text("Filter machines")
+                .margin(Margin::symmetric(10.0, if mobile::is_touch() { 14.0 } else { 8.0 }))
+                .desired_width(f32::INFINITY),
+        );
+        mobile::text_target(filter.rect);
+        ui.add_space(4.0);
 
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        if self.agents.is_empty() && !self.agents_loading {
-                            ui.add_space(8.0);
-                            ui.label(RichText::new("No agents connected.").size(12.5).color(p.text_muted));
-                        }
-                        let agents = self.agents.clone();
-                        for a in &agents {
-                            let selected = self.selected.as_deref() == Some(&a.agent_id);
-                            if agent_row(ui, p, a, selected).clicked() {
-                                self.select_agent(&a.agent_id);
-                                self.show_agents = false;
-                            }
-                        }
-                        ui.add_space(8.0);
-                        ui.separator();
-                        self.ui_installer(ui, p);
-                        self.ui_downloads(ui, p);
-                    });
-            }
+        if let Some(err) = &self.agents_error {
+            ui.label(RichText::new(format!("Could not load machines: {err}")).size(12.0).color(p.danger));
         }
+
+        let needle = self.filter.trim().to_lowercase();
+        let (on, off): (Vec<AgentInfo>, Vec<AgentInfo>) = self
+            .agents
+            .iter()
+            .filter(|a| {
+                needle.is_empty()
+                    || a.name.to_lowercase().contains(&needle)
+                    || a.agent_id.to_lowercase().contains(&needle)
+                    || a.os.to_lowercase().contains(&needle)
+            })
+            .cloned()
+            .partition(|a| a.allow_remote);
+
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = 2.0;
+            if self.agents.is_empty() {
+                ui.add_space(8.0);
+                ui.label(RichText::new(if self.agents_loading { "Loading machines…" } else { "No machines connected. Add one to get started." }).size(13.0).color(p.text_muted));
+            } else if on.is_empty() && off.is_empty() {
+                ui.add_space(8.0);
+                ui.label(RichText::new("Nothing matches this filter.").size(13.0).color(p.text_muted));
+            }
+            for (title, group) in [("Remote on", &on), ("Listed only", &off)] {
+                if group.is_empty() {
+                    continue;
+                }
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(10.0);
+                    ui.label(RichText::new(format!("{title} · {}", group.len())).size(12.0).color(p.text_secondary));
+                });
+                ui.add_space(2.0);
+                for a in group {
+                    let selected = self.selected.as_deref() == Some(&a.agent_id);
+                    if agent_row(ui, p, a, selected).clicked() {
+                        self.select_agent(&a.agent_id);
+                        self.show_agents = false;
+                    }
+                }
+            }
+        });
     }
 
     fn select_agent(&mut self, id: &str) {
@@ -570,306 +531,357 @@ impl RustlitelApp {
         }
     }
 
-    fn ui_installer(&mut self, ui: &mut egui::Ui, p: &Palette) {
-        egui::CollapsingHeader::new(RichText::new("Add an agent").size(13.0).color(p.text_secondary))
-            .id_salt("add_agent")
-            .show(ui, |ui| {
-                ui.label(RichText::new("Generate a one-click installer link to open on the target machine.").size(12.0).color(p.text_muted));
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("OS").size(12.5).color(p.text_secondary));
-                    egui::ComboBox::from_id_salt("inst_os")
-                        .selected_text(&self.inst_os)
-                        .width(90.0)
-                        .show_ui(ui, |ui| {
-                            for os in ["windows", "macos", "linux"] {
-                                ui.selectable_value(&mut self.inst_os, os.to_string(), os);
-                            }
-                        });
+    // --- add a machine ---
+
+    fn ui_add_machine(&mut self, ctx: &egui::Context) {
+        if !self.show_add {
+            return;
+        }
+        let p = theme::current(ctx);
+        let mut close = scrim(ctx);
+        let width = 480.0_f32.min(ctx.screen_rect().width() - 24.0);
+        dialog("Add a machine", width, &p).show(ctx, |ui| {
+            ui.set_width(width - 40.0);
+            row(ui, 30.0, |ui| {
+                ui.label(RichText::new("Add a machine").font(theme::semibold(16.0)).color(p.text));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui.add(plain("Close", &p)).clicked() {
+                        close = true;
+                    }
                 });
+            });
+            ui.add_space(8.0);
+
+            const OS: [(&str, &str); 3] = [("Windows", "windows"), ("macOS", "macos"), ("Linux", "linux")];
+            row(ui, 36.0, |ui| {
+                ui.label(RichText::new("System").size(12.0).color(p.text_secondary));
+                let on = OS.iter().position(|o| o.1 == self.inst_os).unwrap_or(0);
+                if let Some(i) = segmented(ui, &OS.map(|o| o.0), on) {
+                    self.inst_os = OS[i].1.to_string();
+                    self.inst_link = None;
+                }
+            });
+            ui.add_space(6.0);
+            row(ui, 36.0, |ui| {
+                ui.label(RichText::new("Name").size(12.0).color(p.text_secondary));
                 let name = ui.add(
                     egui::TextEdit::singleline(&mut self.inst_name)
-                        .hint_text("name (optional)")
+                        .hint_text("Defaults to the hostname")
+                        .margin(Margin::symmetric(10.0, 7.0))
                         .desired_width(f32::INFINITY),
                 );
                 mobile::text_target(name.rect);
-                ui.add_space(4.0);
-                let ctx = ui.ctx().clone();
-                if accent_button(ui, p, "Generate link", !self.inst_busy).clicked() && !self.inst_busy {
-                    self.do_installer(&ctx);
-                }
-                if self.inst_busy {
-                    ui.add(egui::Spinner::new().size(14.0));
-                }
-                if let Some(err) = &self.inst_error {
-                    ui.label(RichText::new(err).size(12.0).color(p.danger));
-                }
-                if let Some(link) = &self.inst_link {
-                    ui.add_space(4.0);
-                    ui.label(RichText::new(format!("valid {} days", link.expires_days)).size(11.5).color(p.text_muted));
-                    let url = link.url.clone();
-                    if ui.add(egui::Button::new(RichText::new("Copy link").size(12.5)).fill(Color32::TRANSPARENT).stroke(Stroke::new(0.5_f32,p.border_strong))).clicked() {
-                        ui.ctx().copy_text(url.clone());
-                    }
-                    let mut shown = url.clone();
-                    ui.add(egui::TextEdit::singleline(&mut shown).font(FontId::monospace(11.0)).desired_width(f32::INFINITY));
-                    if self.inst_os != "windows" {
-                        // Through curl: a browser download is not executable and
-                        // macOS quarantines it.
-                        let cmd = format!("curl -fsSL {url} -o rustlitel-agent && chmod +x rustlitel-agent && ./rustlitel-agent");
-                        ui.label(RichText::new("On the target, in a terminal:").size(11.5).color(p.text_muted));
-                        let mut shown = cmd.clone();
-                        ui.add(egui::TextEdit::multiline(&mut shown).font(FontId::monospace(11.0)).desired_rows(3).desired_width(f32::INFINITY));
-                        if ui.add(egui::Button::new(RichText::new("Copy command").size(12.5)).fill(Color32::TRANSPARENT).stroke(Stroke::new(0.5_f32,p.border_strong))).clicked() {
-                            ui.ctx().copy_text(cmd);
-                        }
-                    }
+                if name.changed() {
+                    self.inst_link = None;
                 }
             });
-    }
+            ui.add_space(10.0);
 
-    fn ui_downloads(&mut self, ui: &mut egui::Ui, p: &Palette) {
-        egui::CollapsingHeader::new(RichText::new("Download agent").size(13.0).color(p.text_secondary))
-            .id_salt("downloads")
-            .show(ui, |ui| {
+            if let Some(link) = &self.inst_link {
+                let url = link.url.clone();
+                let days = link.expires_days;
+                let windows = self.inst_os == "windows";
+                let (hint, shown) = if windows {
+                    (format!("Open this link on that machine and run the file it downloads. The link works for {days} days, and anyone holding it can add a machine."), url.clone())
+                } else {
+                    // Through curl: a browser download is not executable and
+                    // macOS quarantines it.
+                    (format!("Run this in a terminal on that machine. The link works for {days} days, and anyone holding it can add a machine."),
+                     format!("curl -fsSL {url} -o rustlitel-agent && chmod +x rustlitel-agent && ./rustlitel-agent"))
+                };
+                ui.label(RichText::new(hint).size(13.0).color(p.text_secondary));
+                ui.add_space(4.0);
+                let mut readonly = shown.as_str();
+                ui.add(
+                    egui::TextEdit::multiline(&mut readonly)
+                        .font(FontId::monospace(12.0))
+                        .desired_rows(if windows { 2 } else { 4 })
+                        .desired_width(f32::INFINITY),
+                );
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.add(primary(if windows { "Copy link" } else { "Copy command" }, control_height())).clicked() {
+                        ctx.copy_text(shown.clone());
+                        self.inst_copied = true;
+                    }
+                    if !windows && ui.add(ghost("Copy link", &p).min_size(vec2(0.0, control_height()))).clicked() {
+                        ctx.copy_text(url.clone());
+                        self.inst_copied = true;
+                    }
+                    if self.inst_copied {
+                        ui.label(RichText::new("Copied").size(12.0).color(p.success));
+                    }
+                });
+            } else if ui.add_enabled(!self.inst_busy, primary("Create link", control_height())).clicked() {
+                self.inst_copied = false;
+                self.do_installer(ctx);
+            }
+            if self.inst_busy {
+                ui.add(egui::Spinner::new().size(14.0));
+            }
+            if let Some(err) = &self.inst_error {
+                ui.label(RichText::new(err).size(13.0).color(p.danger));
+            }
+
+            ui.add_space(10.0);
+            ui.separator();
+            ui.add_space(4.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("Stock binaries").size(13.0).color(p.text_secondary));
                 for (label, file) in [
-                    ("Windows (.exe)", "rustlitel-agent-windows.exe"),
+                    ("Windows", "rustlitel-agent-windows.exe"),
                     ("macOS", "rustlitel-agent-macos"),
                     ("Linux", "rustlitel-agent-linux"),
                     ("CLI for macOS", "rustlitel-cli-macos"),
                 ] {
-                    ui.hyperlink_to(RichText::new(label).size(12.5), self.url(&format!("/download/{file}")));
+                    ui.hyperlink_to(RichText::new(label).size(13.0), self.url(&format!("/download/{file}")));
                 }
             });
+        });
+        if close {
+            self.show_add = false;
+        }
     }
 
-    // --- central ---
+    // --- selected machine ---
 
     fn ui_central(&mut self, ctx: &egui::Context) {
         let p = theme::current(ctx);
-        egui::CentralPanel::default()
-            .frame(egui::Frame::none().fill(p.page).inner_margin(Margin::same(16.0)))
-            .show(ctx, |ui| {
-                let Some(agent_id) = self.selected.clone() else {
-                    ui.vertical_centered(|ui| {
-                        ui.add_space(ui.available_height() * 0.4);
-                        ui.label(RichText::new("Select an agent on the left.").color(p.text_muted));
-                    });
-                    return;
-                };
-                let agent = self.agents.iter().find(|a| a.agent_id == agent_id).cloned();
+        egui::CentralPanel::default().frame(egui::Frame::none().fill(p.page)).show(ctx, |ui| {
+            let Some(agent_id) = self.selected.clone() else {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(ui.available_height() * 0.42);
+                    ui.label(RichText::new("Pick a machine on the left.").size(14.0).color(p.text_muted));
+                });
+                return;
+            };
+            let agent = self.agents.iter().find(|a| a.agent_id == agent_id).cloned();
+            self.ui_machine_head(ui, &p, &agent_id, agent.as_ref());
+            match self.tab {
+                CentralTab::Terminal => self.ui_terminal(ui, &p, &agent_id, agent.as_ref()),
+                CentralTab::Exec => self.ui_exec(ui, &p, &agent_id, agent.as_ref()),
+            }
+        });
+    }
 
-                if is_narrow(ui.ctx())
-                    && ui.add(egui::Button::new(RichText::new("\u{2190} Agents").size(12.5).color(p.text_secondary)).fill(Color32::TRANSPARENT).stroke(Stroke::NONE)).clicked()
-                {
-                    self.show_agents = true;
-                }
+    fn ui_machine_head(&mut self, ui: &mut egui::Ui, p: &Palette, agent_id: &str, agent: Option<&AgentInfo>) {
+        let narrow = is_narrow(ui.ctx());
+        let name = agent.map_or(agent_id, |a| a.name.as_str()).to_string();
+        let tabs = ["Terminal", "Run command"];
+        let tab_on = if self.tab == CentralTab::Terminal { 0 } else { 1 };
+        let term_state = self.term.as_ref().map(|t| (t.open, t.closed, t.status.clone()));
 
-                // header row
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(agent.as_ref().map(|a| a.name.clone()).unwrap_or_else(|| agent_id.clone())).size(16.0).strong().color(p.text));
-                    if let Some(a) = &agent {
-                        let shell = a.shells.first().cloned().unwrap_or_default();
-                        ui.label(RichText::new(format!("{} · {}", short_os(&a.os), shell)).size(12.5).color(p.text_muted));
-                        ui.add_space(2.0);
-                        if a.allow_remote {
-                            pill(ui, "remote on", p.success, mix(p.success, p.page, 0.82));
-                        } else {
-                            pill(ui, "remote off", p.text_muted, p.hover);
+        let head = egui::Frame::none()
+            .fill(if narrow { p.card } else { p.page })
+            .inner_margin(if narrow { Margin::symmetric(6.0, 4.0) } else { Margin::symmetric(16.0, 11.0) })
+            .show(ui, |ui| {
+                row(ui, if narrow { 44.0 } else { 30.0 }, |ui| {
+                    if narrow && ui.add(plain("\u{2190} Machines", p).min_size(vec2(0.0, 44.0))).clicked() {
+                        self.show_agents = true;
+                    }
+                    ui.label(RichText::new(&name).font(FontId::monospace(if narrow { 13.0 } else { 15.0 })).strong().color(p.text));
+                    if !narrow {
+                        let sub = agent.map_or("not connected".to_string(), |a| a.os.replace(' ', " · "));
+                        ui.label(RichText::new(sub).size(12.0).color(p.text_muted));
+                        ui.add_space(4.0);
+                        if let Some(i) = segmented(ui, &tabs, tab_on) {
+                            self.tab = if i == 0 { CentralTab::Terminal } else { CentralTab::Exec };
                         }
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui
-                            .add(egui::Button::new(RichText::new("Uninstall").size(12.5).color(p.danger)).fill(Color32::TRANSPARENT).stroke(Stroke::new(0.5_f32,p.danger)))
-                            .on_hover_text("Tell the agent to remove itself from that machine")
-                            .clicked()
-                        {
-                            self.confirm_uninstall = Some(agent_id.clone());
-                        }
+                        self.ui_head_actions(ui, p, agent_id, narrow, term_state.as_ref());
                     });
                 });
-
-                ui.add_space(10.0);
-
-                // tabs + (when a terminal is open) status and disconnect
-                let term_state = self.term.as_ref().map(|t| (t.open, t.closed, t.status.clone()));
-                let mut disconnect = false;
-                ui.horizontal(|ui| {
-                    if tab(ui, &p, "Terminal", self.tab == CentralTab::Terminal).clicked() {
-                        self.tab = CentralTab::Terminal;
-                    }
-                    ui.add_space(14.0);
-                    if tab(ui, &p, "Exec", self.tab == CentralTab::Exec).clicked() {
-                        self.tab = CentralTab::Exec;
-                    }
-                    if self.tab == CentralTab::Terminal {
-                        if let Some((open, closed, status)) = &term_state {
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                if ui
-                                    .add(egui::Button::new(RichText::new(if *closed { "Close" } else { "Disconnect" }).size(12.0).color(p.text_secondary)).fill(Color32::TRANSPARENT).stroke(Stroke::new(0.5_f32, p.border_strong)))
-                                    .clicked()
-                                {
-                                    disconnect = true;
-                                }
-                                ui.add_space(8.0);
-                                let (c, label) = if *closed {
-                                    (p.text_muted, status.clone())
-                                } else if *open {
-                                    (p.success, "connected".to_string())
-                                } else {
-                                    (p.warning, "connecting…".to_string())
-                                };
-                                ui.label(RichText::new(label).size(12.0).color(c));
-                                dot(ui, c, 7.0);
-                            });
+                if narrow {
+                    ui.horizontal(|ui| {
+                        ui.add_space(6.0);
+                        if let Some(i) = segmented(ui, &tabs, tab_on) {
+                            self.tab = if i == 0 { CentralTab::Terminal } else { CentralTab::Exec };
                         }
-                    }
-                });
-                if disconnect {
-                    self.term = None;
-                }
-                ui.add_space(3.0);
-                ui.separator();
-                ui.add_space(8.0);
-
-                match self.tab {
-                    CentralTab::Terminal => self.ui_terminal(ui, &p, &agent_id),
-                    CentralTab::Exec => self.ui_exec(ui, &p, &agent_id),
+                    });
                 }
             });
+        ui.painter().hline(ui.max_rect().x_range(), head.response.rect.bottom(), Stroke::new(1.0_f32, p.border));
     }
 
-    fn ui_terminal(&mut self, ui: &mut egui::Ui, p: &Palette, agent_id: &str) {
-        if self.term.is_none() {
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                let shells = self
-                    .agents
-                    .iter()
-                    .find(|a| a.agent_id == agent_id)
-                    .map(|a| a.shells.clone())
-                    .unwrap_or_default();
-                if !shells.is_empty() {
-                    ui.label(RichText::new("shell").size(12.5).color(p.text_secondary));
-                    egui::ComboBox::from_id_salt("term_shell")
-                        .selected_text(if self.term_shell.is_empty() {
-                            "default"
-                        } else {
-                            self.term_shell.as_str()
-                        })
-                        .show_ui(ui, |ui| {
-                            for s in &shells {
-                                ui.selectable_value(&mut self.term_shell, s.clone(), s);
-                            }
-                        });
-                    ui.add_space(6.0);
-                }
-                if ui
-                    .add(egui::Button::new(RichText::new("Open terminal").color(Color32::WHITE)).fill(p.accent).min_size(vec2(150.0, 32.0)))
-                    .clicked()
-                {
-                    let shell = (!self.term_shell.is_empty()).then(|| self.term_shell.clone());
-                    match Terminal::connect(&self.ws_origin, agent_id, shell.as_deref(), ui.ctx()) {
-                        Ok(t) => self.term = Some(t),
-                        Err(e) => self.note = Some(format!("Terminal error: {e}")),
+    fn ui_head_actions(&mut self, ui: &mut egui::Ui, p: &Palette, agent_id: &str, narrow: bool, term: Option<&(bool, bool, String)>) {
+        let height = if narrow { 44.0 } else { 30.0 };
+        match (self.tab, term) {
+            (CentralTab::Terminal, Some((open, closed, status))) => {
+                if *closed {
+                    if ui.add(primary("Reconnect", height)).clicked() {
+                        self.open_terminal(ui.ctx(), agent_id);
                     }
+                    if ui.add(ghost("Close", p).min_size(vec2(0.0, height))).clicked() {
+                        self.term = None;
+                    }
+                    ui.label(RichText::new(status).size(12.0).color(p.text_muted));
+                } else {
+                    if ui.add(ghost(if narrow { "End" } else { "Disconnect" }, p).min_size(vec2(0.0, height))).clicked() {
+                        self.term = None;
+                    }
+                    let (c, label) = if *open { (p.success, "connected") } else { (p.warning, "connecting…") };
+                    ui.label(RichText::new(label).size(12.0).color(c));
+                    dot(ui, c, 7.0);
                 }
+            }
+            _ => {
+                let uninstall = egui::Button::new(RichText::new(if narrow { "Uninstall" } else { "Uninstall agent" }).size(13.0).color(p.danger))
+                    .fill(Color32::TRANSPARENT)
+                    .stroke(Stroke::new(1.0_f32, p.border))
+                    .min_size(vec2(0.0, height));
+                if ui.add(uninstall).clicked() {
+                    self.confirm_uninstall = Some(agent_id.to_string());
+                }
+            }
+        }
+    }
+
+    fn open_terminal(&mut self, ctx: &egui::Context, agent_id: &str) {
+        let shell = (!self.term_shell.is_empty()).then(|| self.term_shell.clone());
+        let grid = term::grid_for(ctx, self.term_area);
+        match Terminal::connect(&self.ws_origin, agent_id, shell.as_deref(), ctx, grid) {
+            Ok(t) => self.term = Some(t),
+            Err(e) => self.note = Some(format!("Could not open the terminal: {e}")),
+        }
+    }
+
+    fn ui_terminal(&mut self, ui: &mut egui::Ui, p: &Palette, agent_id: &str, agent: Option<&AgentInfo>) {
+        // Everything around the grid: frame margins, and the status or key bar.
+        let chrome = if mobile::is_touch() { vec2(12.0, 12.0 + term::KEY_BAR_HEIGHT) } else { vec2(28.0, 24.0 + 26.0) };
+        self.term_area = ui.available_size() - chrome;
+        if self.term.is_none() {
+            egui::Frame::none().inner_margin(Margin::same(24.0)).show(ui, |ui| {
+                let Some(a) = agent else {
+                    ui.label(RichText::new("This machine is not connected right now. Its agent reconnects on its own.").size(14.0).color(p.text_secondary));
+                    return;
+                };
+                if !a.allow_remote {
+                    remote_off_note(ui, p);
+                    return;
+                }
+                ui.label(RichText::new(format!("Open a shell on {}", a.name)).font(theme::semibold(16.0)).color(p.text));
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    shell_combo(ui, "term_shell", &mut self.term_shell, &a.shells);
+                    if ui.add(primary("Open terminal", control_height())).clicked() {
+                        self.open_terminal(ui.ctx(), agent_id);
+                    }
+                });
             });
-            ui.add_space(6.0);
-            ui.label(RichText::new("Opens an interactive shell on the agent. Tap or click the view, then type.").size(12.5).color(p.text_muted));
             return;
         }
 
-        // Connected: the terminal fills the remaining height; Disconnect and the
-        // connection status live in the tab row above.
+        let capture = !self.modal_open();
+        let now = ui.input(|i| i.time);
+        if !mobile::is_touch() {
+            let t = self.term.as_ref().unwrap();
+            let scrolled = t.scrolled_back();
+            let right = match (scrolled, t.opened_at) {
+                (n, _) if n > 0 => format!("{n} lines back, type to return"),
+                (_, Some(at)) => format!("session {}", human_dur((now - at).max(0.0) as u64)),
+                _ => String::new(),
+            };
+            let left = format!("{}   {}×{}   drag to copy", self.term_shell, t.cols, t.rows);
+            egui::TopBottomPanel::bottom("term_status")
+                .exact_height(26.0)
+                .frame(egui::Frame::none().fill(p.card).inner_margin(Margin::symmetric(14.0, 0.0)))
+                .show_separator_line(false)
+                .show_inside(ui, |ui| {
+                    ui.horizontal_centered(|ui| {
+                        ui.label(RichText::new(left).font(FontId::monospace(12.0)).color(p.text_muted));
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            ui.label(RichText::new(right).font(FontId::monospace(12.0)).color(p.text_muted));
+                        });
+                    });
+                });
+        }
         egui::Frame::none()
             .fill(theme::TERM_BG)
-            .stroke(Stroke::new(0.5_f32, p.border_strong))
-            .rounding(8.0)
-            .inner_margin(Margin::same(10.0))
+            .inner_margin(if mobile::is_touch() { Margin::same(6.0) } else { Margin::symmetric(14.0, 12.0) })
             .show(ui, |ui| {
-                self.term.as_mut().unwrap().ui(ui);
+                self.term.as_mut().unwrap().ui(ui, capture);
             });
-        ui.ctx().request_repaint_after(std::time::Duration::from_millis(40));
+        // The session age in the status bar.
+        ui.ctx().request_repaint_after(std::time::Duration::from_secs(30));
     }
 
-    fn ui_exec(&mut self, ui: &mut egui::Ui, p: &Palette, agent_id: &str) {
-        ui.label(RichText::new("Command").size(12.5).color(p.text_secondary));
-        ui.add_space(4.0);
-        let cmd = ui.add(
-            egui::TextEdit::multiline(&mut self.exec_cmd)
-                .desired_rows(3)
-                .font(FontId::monospace(13.0))
-                .desired_width(f32::INFINITY)
-                .hint_text("Get-Service Spooler | Restart-Service"),
-        );
-        mobile::text_target(cmd.rect);
-        ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            let shells = self
-                .agents
-                .iter()
-                .find(|a| a.agent_id == agent_id)
-                .map(|a| a.shells.clone())
-                .unwrap_or_default();
-            if !shells.is_empty() {
-                ui.label(RichText::new("shell").size(12.5).color(p.text_secondary));
-                egui::ComboBox::from_id_salt("exec_shell")
-                    .selected_text(if self.exec_shell.is_empty() {
-                        "default"
-                    } else {
-                        self.exec_shell.as_str()
-                    })
-                    .show_ui(ui, |ui| {
-                        for s in &shells {
-                            ui.selectable_value(&mut self.exec_shell, s.clone(), s);
+    fn ui_exec(&mut self, ui: &mut egui::Ui, p: &Palette, agent_id: &str, agent: Option<&AgentInfo>) {
+        if agent.is_some_and(|a| !a.allow_remote) {
+            egui::Frame::none().inner_margin(Margin::same(24.0)).show(ui, |ui| remote_off_note(ui, p));
+            return;
+        }
+        let shells = agent.map(|a| a.shells.clone()).unwrap_or_default();
+        egui::Frame::none().inner_margin(Margin::same(16.0)).show(ui, |ui| {
+            let run_shortcut = ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Enter));
+            let cmd = ui.add(
+                egui::TextEdit::multiline(&mut self.exec_cmd)
+                    .desired_rows(3)
+                    .font(FontId::monospace(13.0))
+                    .margin(Margin::symmetric(12.0, 10.0))
+                    .desired_width(f32::INFINITY)
+                    .hint_text("Get-Service Spooler | Restart-Service"),
+            );
+            mobile::text_target(cmd.rect);
+            ui.add_space(8.0);
+            let can_run = !self.exec_busy && !self.exec_cmd.trim().is_empty();
+            let mut run = run_shortcut && can_run;
+            ui.horizontal_wrapped(|ui| {
+                shell_combo(ui, "exec_shell", &mut self.exec_shell, &shells);
+                ui.label(RichText::new("Timeout, s").size(12.0).color(p.text_secondary));
+                let timeout = ui.add(
+                    egui::TextEdit::singleline(&mut self.exec_timeout)
+                        .hint_text("120")
+                        .margin(Margin::symmetric(8.0, 6.0))
+                        .desired_width(52.0),
+                );
+                mobile::text_target(timeout.rect);
+                run |= ui.add_enabled(can_run, primary("Run", control_height())).clicked();
+                if self.exec_busy {
+                    ui.add(egui::Spinner::new().size(14.0));
+                    ui.label(RichText::new("Running…").size(12.0).color(p.text_muted));
+                }
+            });
+            if run {
+                self.do_exec(ui.ctx(), agent_id);
+            }
+            ui.add_space(12.0);
+
+            match &self.exec_result {
+                None => {
+                    ui.label(RichText::new("Output appears here.").size(13.0).color(p.text_muted));
+                }
+                Some(Err(e)) => {
+                    ui.label(RichText::new(format!("The command did not run: {e}")).size(13.0).color(p.danger));
+                }
+                Some(Ok(r)) => {
+                    ui.horizontal(|ui| {
+                        match r.exit_code {
+                            Some(0) => pill(ui, "exit 0", p.success, mix(p.success, p.page, 0.85)),
+                            Some(c) => pill(ui, &format!("exit {c}"), p.danger, mix(p.danger, p.page, 0.85)),
+                            None => pill(ui, "no exit code", p.warning, mix(p.warning, p.page, 0.85)),
+                        }
+                        if r.truncated {
+                            ui.label(RichText::new("Output was cut at the relay's limit.").size(12.0).color(p.text_muted));
                         }
                     });
-            }
-            ui.label(RichText::new("timeout (s)").size(12.5).color(p.text_secondary));
-            let timeout = ui.add(egui::TextEdit::singleline(&mut self.exec_timeout).hint_text("default").desired_width(64.0));
-            mobile::text_target(timeout.rect);
-            let ctx = ui.ctx().clone();
-            let can_run = !self.exec_busy && !self.exec_cmd.trim().is_empty();
-            if accent_button(ui, p, "Run", can_run).clicked() && can_run {
-                self.do_exec(&ctx, agent_id);
-            }
-            if self.exec_busy {
-                ui.add(egui::Spinner::new().size(14.0));
-            }
-        });
-        ui.add_space(8.0);
-
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| match &self.exec_result {
-            None => {
-                ui.label(RichText::new("Run a command to see its output.").size(12.5).color(p.text_muted));
-            }
-            Some(Err(e)) => {
-                ui.label(RichText::new(e).color(p.danger));
-            }
-            Some(Ok(r)) => {
-                ui.horizontal(|ui| {
-                    match r.exit_code {
-                        Some(0) => pill(ui, "exit 0", p.success, mix(p.success, p.page, 0.82)),
-                        Some(c) => pill(ui, &format!("exit {c}"), p.danger, mix(p.danger, p.page, 0.82)),
-                        None => pill(ui, "no exit code", p.warning, mix(p.warning, p.page, 0.82)),
+                    if let Some(err) = &r.error {
+                        ui.label(RichText::new(err).size(13.0).color(p.danger));
                     }
-                    if r.truncated {
-                        ui.label(RichText::new("(truncated)").size(11.5).color(p.text_muted));
-                    }
-                });
-                if let Some(err) = &r.error {
-                    ui.label(RichText::new(err).color(p.danger));
-                }
-                if !r.stdout.is_empty() {
                     ui.add_space(6.0);
-                    ui.label(RichText::new("stdout").size(11.5).color(p.text_muted));
-                    term_block(ui, &r.stdout);
-                }
-                if !r.stderr.is_empty() {
-                    ui.add_space(6.0);
-                    ui.label(RichText::new("stderr").size(11.5).color(p.text_muted));
-                    term_block(ui, &r.stderr);
+                    egui::Frame::none()
+                        .fill(theme::TERM_BG)
+                        .rounding(6.0)
+                        .inner_margin(Margin::symmetric(14.0, 12.0))
+                        .show(ui, |ui| {
+                            egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
+                                if r.stdout.is_empty() && r.stderr.is_empty() {
+                                    ui.label(RichText::new("The command printed nothing.").font(FontId::monospace(13.0)).color(p.text_muted));
+                                }
+                                output_block(ui, &r.stdout, theme::TERM_FG);
+                                output_block(ui, &r.stderr, theme::DARK.danger);
+                            });
+                        });
                 }
             }
         });
@@ -880,34 +892,27 @@ impl RustlitelApp {
             return;
         };
         let p = theme::current(ctx);
-        let mut open = true;
+        let mut cancel = scrim(ctx);
         let mut do_it = false;
-        let mut cancel = false;
-        egui::Window::new(RichText::new("Uninstall agent?").color(p.text))
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, vec2(0.0, 0.0))
-            .frame(egui::Frame::none().fill(p.card).stroke(Stroke::new(0.5_f32,p.border_strong)).rounding(12.0).inner_margin(Margin::same(16.0)))
-            .open(&mut open)
-            .show(ctx, |ui| {
-                ui.set_max_width(320.0);
-                ui.label(RichText::new(format!("Tell “{agent_id}” to stop its service and delete itself from that machine?")));
-                ui.add_space(4.0);
-                ui.label(RichText::new("This can't be undone from here — you'd reinstall to get it back.").size(12.5).color(p.text_muted));
-                ui.add_space(12.0);
-                ui.horizontal(|ui| {
-                    if ui.add(egui::Button::new(RichText::new("Uninstall").color(Color32::WHITE)).fill(p.danger)).clicked() {
-                        do_it = true;
-                    }
-                    if ui.add(egui::Button::new("Cancel").fill(Color32::TRANSPARENT).stroke(Stroke::new(0.5_f32,p.border_strong))).clicked() {
-                        cancel = true;
-                    }
-                });
+        let width = 400.0_f32.min(ctx.screen_rect().width() - 24.0);
+        dialog("Uninstall agent", width, &p).show(ctx, |ui| {
+            ui.set_width(width - 40.0);
+            ui.label(RichText::new(format!("Uninstall the agent on {agent_id}?")).font(theme::semibold(16.0)).color(p.text));
+            ui.add_space(6.0);
+            ui.label(RichText::new("It stops its service and deletes itself. To get this machine back you need access to it by other means, to install the agent again.").size(13.0).color(p.text_secondary));
+            ui.add_space(14.0);
+            ui.horizontal(|ui| {
+                let danger = egui::Button::new(RichText::new("Uninstall agent").size(13.0).color(Color32::WHITE))
+                    .fill(p.danger)
+                    .min_size(vec2(0.0, control_height()));
+                do_it = ui.add(danger).clicked();
+                cancel |= ui.add(ghost("Keep it", &p).min_size(vec2(0.0, control_height()))).clicked();
             });
+        });
         if do_it {
             self.do_uninstall(ctx, &agent_id);
             self.confirm_uninstall = None;
-        } else if cancel || !open {
+        } else if cancel {
             self.confirm_uninstall = None;
         }
     }
@@ -918,11 +923,17 @@ impl eframe::App for RustlitelApp {
         mobile::begin_frame();
         self.ensure_theme(ctx);
         self.drain(ctx);
+        let now = ctx.input(|i| i.time);
+        if let Some(t) = self.term.as_mut() {
+            t.pump(now);
+        }
 
         match self.auth {
             Auth::Unknown => {
-                self.fetch_me(ctx);
-                self.auth = Auth::Anon;
+                if !self.me_requested {
+                    self.me_requested = true;
+                    self.fetch_me(ctx);
+                }
                 let p = theme::current(ctx);
                 egui::CentralPanel::default().frame(egui::Frame::none().fill(p.page)).show(ctx, |ui| {
                     ui.vertical_centered(|ui| {
@@ -939,41 +950,45 @@ impl eframe::App for RustlitelApp {
             Auth::Authed { .. } => {}
         }
 
-        let now = ctx.input(|i| i.time);
-        if now - self.last_agents_fetch > 5.0 && !self.agents_loading {
+        // Without this nothing wakes an idle page, and the list goes stale.
+        if now - self.last_agents_fetch > AGENTS_POLL_SECS && !self.agents_loading {
             self.last_agents_fetch = now;
             self.fetch_agents(ctx);
         }
+        ctx.request_repaint_after(std::time::Duration::from_secs_f64(AGENTS_POLL_SECS));
 
-        self.ui_header(ctx);
+        let narrow = is_narrow(ctx);
+        let list_screen = narrow && (self.show_agents || self.selected.is_none());
+        if !narrow || list_screen {
+            self.ui_header(ctx);
+        }
         if let Some(note) = self.note.clone() {
             let p = theme::current(ctx);
             egui::TopBottomPanel::bottom("note")
-                .frame(egui::Frame::none().fill(p.card).inner_margin(Margin::symmetric(14.0, 8.0)).stroke(Stroke::new(0.5_f32,p.border)))
+                .frame(egui::Frame::none().fill(p.card).inner_margin(Margin::symmetric(14.0, 8.0)).stroke(Stroke::new(1.0_f32, p.border)))
                 .show(ctx, |ui| {
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new(&note).size(12.5).color(p.text_secondary));
+                        ui.label(RichText::new(&note).size(13.0).color(p.text_secondary));
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if ui.add(egui::Button::new(RichText::new("dismiss").size(12.0).color(p.text_muted)).fill(Color32::TRANSPARENT).stroke(Stroke::NONE)).clicked() {
+                            if ui.add(plain("Dismiss", &p)).clicked() {
                                 self.note = None;
                             }
                         });
                     });
                 });
         }
-        if is_narrow(ctx) && (self.show_agents || self.selected.is_none()) {
+        if list_screen {
             let p = theme::current(ctx);
             egui::CentralPanel::default()
-                .frame(egui::Frame::none().fill(p.card).inner_margin(Margin::same(12.0)))
+                .frame(egui::Frame::none().fill(p.page).inner_margin(Margin::same(12.0)))
                 .show(ctx, |ui| self.ui_agents(ui, &p));
-            // Keeps an open terminal's socket drained while its view is away.
-            ctx.request_repaint_after(std::time::Duration::from_millis(250));
         } else {
-            if !is_narrow(ctx) {
+            if !narrow {
                 self.ui_side(ctx);
             }
             self.ui_central(ctx);
         }
+        self.ui_add_machine(ctx);
         self.ui_confirm_uninstall(ctx);
     }
 
@@ -982,39 +997,134 @@ impl eframe::App for RustlitelApp {
     }
 }
 
-/// Too narrow for the agent list next to the terminal (a phone held upright).
+// --- layout rules -----------------------------------------------------------
+
+const AGENTS_POLL_SECS: f64 = 5.0;
+
+/// Too narrow for the machine list next to the terminal (a phone held upright).
 fn is_narrow(ctx: &egui::Context) -> bool {
     ctx.screen_rect().width() < 700.0
 }
 
-// --- small painted widgets --------------------------------------------------
-
-fn wordmark(ui: &mut egui::Ui, p: &Palette, size: f32) {
-    ui.horizontal(|ui| {
-        let d = size * 0.9;
-        let (rect, _) = ui.allocate_exact_size(vec2(d, d), Sense::hover());
-        ui.painter().rect_filled(rect, Rounding::same(d * 0.28), p.accent);
-        ui.painter().text(
-            rect.center(),
-            egui::Align2::CENTER_CENTER,
-            ">_",
-            FontId::monospace(size * 0.5),
-            Color32::WHITE,
-        );
-        ui.add_space(2.0);
-        ui.label(RichText::new("rustlitel").size(size).strong().color(p.text));
-    });
+/// Fingers need 44 pt; a mouse does not.
+fn control_height() -> f32 {
+    if mobile::is_touch() {
+        44.0
+    } else {
+        30.0
+    }
 }
 
-fn user_chip(ui: &mut egui::Ui, p: &Palette, name: &str) {
-    ui.horizontal(|ui| {
-        let (rect, _) = ui.allocate_exact_size(vec2(22.0, 22.0), Sense::hover());
-        ui.painter().circle_filled(rect.center(), 11.0, p.accent_muted);
-        let initials: String = name.chars().take(2).collect();
-        ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, initials, FontId::proportional(11.0), p.accent);
-        ui.add_space(2.0);
-        ui.label(RichText::new(name).size(13.0).color(p.text_secondary));
-    });
+// --- widgets ----------------------------------------------------------------
+
+/// A left-to-right row of the given height with everything centred on one line.
+fn row(ui: &mut egui::Ui, height: f32, add: impl FnOnce(&mut egui::Ui)) {
+    let size = vec2(ui.available_width(), height);
+    ui.allocate_ui_with_layout(size, Layout::left_to_right(Align::Center), add);
+}
+
+fn primary(text: &str, height: f32) -> egui::Button<'static> {
+    egui::Button::new(RichText::new(text).font(theme::semibold(13.0)).color(theme::DARK.on_accent))
+        .fill(theme::DARK.accent)
+        .stroke(Stroke::NONE)
+        .min_size(vec2(0.0, height))
+}
+
+fn ghost(text: &str, p: &Palette) -> egui::Button<'static> {
+    egui::Button::new(RichText::new(text).size(13.0).color(p.text_secondary))
+        .fill(Color32::TRANSPARENT)
+        .stroke(Stroke::new(1.0_f32, p.border))
+        .min_size(vec2(0.0, 30.0))
+}
+
+fn plain(text: &str, p: &Palette) -> egui::Button<'static> {
+    egui::Button::new(RichText::new(text).size(13.0).color(p.text_secondary))
+        .fill(Color32::TRANSPARENT)
+        .stroke(Stroke::NONE)
+}
+
+/// A row of mutually exclusive options; returns the one just clicked. Keeps its
+/// reading order inside a right-to-left parent.
+fn segmented(ui: &mut egui::Ui, labels: &[&str], on: usize) -> Option<usize> {
+    let p = theme::current(ui.ctx());
+    let height = if mobile::is_touch() { 36.0 } else { 24.0 };
+    let mut clicked = None;
+    egui::Frame::none()
+        .stroke(Stroke::new(1.0_f32, p.border))
+        .rounding(7.0)
+        .inner_margin(Margin::same(2.0))
+        .show(ui, |ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
+            ui.horizontal(|ui| {
+                let reversed = ui.layout().main_dir() == egui::Direction::RightToLeft;
+                let mut order: Vec<usize> = (0..labels.len()).collect();
+                if reversed {
+                    order.reverse();
+                }
+                for i in order {
+                    let active = i == on;
+                    let text = RichText::new(labels[i]).size(12.0).color(if active { p.text } else { p.text_secondary });
+                    let button = egui::Button::new(text)
+                        .fill(if active { p.hover } else { Color32::TRANSPARENT })
+                        .stroke(Stroke::NONE)
+                        .rounding(5.0)
+                        .min_size(vec2(0.0, height));
+                    if ui.add(button).clicked() {
+                        clicked = Some(i);
+                    }
+                }
+            });
+        });
+    clicked
+}
+
+fn shell_combo(ui: &mut egui::Ui, id: &str, value: &mut String, shells: &[String]) {
+    if shells.is_empty() {
+        return;
+    }
+    egui::ComboBox::from_id_salt(id)
+        .selected_text(if value.is_empty() { "default shell" } else { value.as_str() })
+        .show_ui(ui, |ui| {
+            for s in shells {
+                ui.selectable_value(value, s.clone(), s);
+            }
+        });
+}
+
+fn remote_off_note(ui: &mut egui::Ui, p: &Palette) {
+    ui.label(RichText::new("Remote access is off on this machine").font(theme::semibold(16.0)).color(p.text));
+    ui.add_space(6.0);
+    ui.label(RichText::new("Its agent runs without --allow-remote, so it shows up here but declines shells and commands. Restart it with that flag to use it.").size(13.0).color(p.text_secondary));
+}
+
+/// Dims the page behind a dialog and swallows its clicks. True when clicked.
+fn scrim(ctx: &egui::Context) -> bool {
+    let screen = ctx.screen_rect();
+    egui::Area::new(egui::Id::new("scrim"))
+        .order(egui::Order::Middle)
+        .fixed_pos(screen.min)
+        .show(ctx, |ui| {
+            ui.painter().rect_filled(screen, 0.0, Color32::from_black_alpha(158));
+            ui.allocate_rect(screen, Sense::click()).clicked()
+        })
+        .inner
+}
+
+fn dialog<'a>(id: &'a str, width: f32, p: &Palette) -> egui::Window<'a> {
+    egui::Window::new(id)
+        .title_bar(false)
+        .collapsible(false)
+        .resizable(false)
+        .order(egui::Order::Foreground)
+        .anchor(egui::Align2::CENTER_CENTER, vec2(0.0, 0.0))
+        .fixed_size(vec2(width - 40.0, 0.0))
+        .frame(egui::Frame::none().fill(p.card).stroke(Stroke::new(1.0_f32, p.border)).rounding(10.0).inner_margin(Margin::same(20.0)))
+}
+
+fn logo(ui: &mut egui::Ui, p: &Palette, size: f32) {
+    let (rect, _) = ui.allocate_exact_size(vec2(size, size), Sense::hover());
+    ui.painter().rect_filled(rect, Rounding::same(size * 0.26), p.accent);
+    ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, ">_", FontId::monospace(size * 0.5), p.on_accent);
 }
 
 fn dot(ui: &mut egui::Ui, color: Color32, d: f32) {
@@ -1025,93 +1135,47 @@ fn dot(ui: &mut egui::Ui, color: Color32, d: f32) {
 fn pill(ui: &mut egui::Ui, text: &str, fg: Color32, bg: Color32) {
     egui::Frame::none()
         .fill(bg)
-        .rounding(6.0)
+        .rounding(4.0)
         .inner_margin(Margin::symmetric(8.0, 2.0))
         .show(ui, |ui| {
-            ui.label(RichText::new(text).size(11.5).color(fg));
+            ui.label(RichText::new(text).font(FontId::monospace(12.0)).color(fg));
         });
 }
 
-/// Accent-filled button that dims its whole fill when disabled, instead of
-/// muted text on a full-accent fill (which reads as broken).
-fn accent_button(ui: &mut egui::Ui, p: &Palette, text: &str, enabled: bool) -> egui::Response {
-    let (fill, fg) = if enabled {
-        (p.accent, Color32::WHITE)
-    } else {
-        (mix(p.accent, p.card, 0.68), p.text_muted)
-    };
-    ui.add(egui::Button::new(RichText::new(text).color(fg)).fill(fill))
-}
-
-fn tab(ui: &mut egui::Ui, p: &Palette, text: &str, active: bool) -> egui::Response {
-    let color = if active { p.text } else { p.text_secondary };
-    let resp = ui.add(
-        egui::Label::new(RichText::new(text).size(13.5).color(color).strong())
-            .sense(Sense::click()),
-    );
-    if active {
-        let r = resp.rect;
-        ui.painter().hline(
-            r.x_range(),
-            r.bottom() + 6.0,
-            Stroke::new(2.0_f32, p.accent),
-        );
-    }
-    resp
-}
-
 fn agent_row(ui: &mut egui::Ui, p: &Palette, a: &AgentInfo, selected: bool) -> egui::Response {
-    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 40.0), Sense::click());
+    let height = if mobile::is_touch() { 52.0 } else { 44.0 };
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::click());
     let painter = ui.painter();
     let bg = if selected {
-        p.accent_muted
+        p.selected
     } else if resp.hovered() {
         p.hover
     } else {
         Color32::TRANSPARENT
     };
-    if bg != Color32::TRANSPARENT {
-        painter.rect_filled(rect, Rounding::same(6.0), bg);
+    painter.rect_filled(rect, Rounding::same(6.0), bg);
+    // Filled when it takes commands, hollow when only listed: shape, not hue alone.
+    let center = egui::pos2(rect.left() + 14.0, rect.center().y);
+    if a.allow_remote {
+        painter.circle_filled(center, 4.0, p.success);
+    } else {
+        painter.circle_stroke(center, 3.5, Stroke::new(1.5_f32, p.text_muted));
     }
-    if selected {
-        let bar = Rect::from_min_size(rect.min, vec2(2.0, rect.height()));
-        painter.rect_filled(bar, Rounding::ZERO, p.accent);
-    }
-    let dot_c = if a.allow_remote { p.success } else { p.text_muted };
-    painter.circle_filled(egui::pos2(rect.left() + 14.0, rect.center().y), 4.0, dot_c);
-    painter.text(
-        egui::pos2(rect.left() + 26.0, rect.top() + 7.0),
-        egui::Align2::LEFT_TOP,
-        &a.name,
-        FontId::proportional(13.5),
-        p.text,
-    );
+    let line = rect.center().y;
+    painter.text(egui::pos2(rect.left() + 28.0, line + 1.0), egui::Align2::LEFT_BOTTOM, &a.name, FontId::monospace(13.0), p.text);
     let sub = if a.allow_remote {
-        format!("{} · {}", short_os(&a.os), human_dur(a.connected_secs))
+        format!("{} · up {}", short_os(&a.os), human_dur(a.connected_secs))
     } else {
         format!("{} · remote off", short_os(&a.os))
     };
-    painter.text(
-        egui::pos2(rect.left() + 26.0, rect.top() + 22.0),
-        egui::Align2::LEFT_TOP,
-        sub,
-        FontId::proportional(11.5),
-        p.text_muted,
-    );
+    painter.text(egui::pos2(rect.left() + 28.0, line + 2.0), egui::Align2::LEFT_TOP, sub, FontId::proportional(12.0), p.text_muted);
     resp
 }
 
-fn term_block(ui: &mut egui::Ui, text: &str) {
-    egui::Frame::none()
-        .fill(theme::TERM_BG)
-        .rounding(8.0)
-        .inner_margin(Margin::same(10.0))
-        .show(ui, |ui| {
-            ui.add(
-                egui::Label::new(RichText::new(text).font(FontId::monospace(12.5)).color(theme::TERM_FG))
-                    .wrap_mode(egui::TextWrapMode::Extend),
-            );
-        });
+fn output_block(ui: &mut egui::Ui, text: &str, color: Color32) {
+    if !text.is_empty() {
+        ui.add(egui::Label::new(RichText::new(text).font(FontId::monospace(13.0)).color(color)).wrap_mode(egui::TextWrapMode::Extend));
+    }
 }
 
 // --- helpers ----------------------------------------------------------------

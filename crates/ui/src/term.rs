@@ -1,18 +1,25 @@
 //! An in-canvas terminal: a `vt100` screen model fed by the relay's WebSocket,
 //! rendered as a character grid with egui, with keyboard input translated back
-//! into terminal byte sequences.
+//! into terminal byte sequences. Keeps history; the wheel or a touch drag scrolls.
 
 use egui::{Color32, FontId, Key};
 use ewebsock::{WsEvent, WsMessage, WsReceiver, WsSender};
 
-const KEY_BAR_BUTTON: f32 = 32.0;
+/// Lines of history kept for scrolling back.
+const SCROLLBACK: usize = 5000;
+const FONT_SIZE: f32 = 13.0;
+const KEY_BAR_BUTTON: f32 = 44.0;
 const KEY_BAR_GAP: f32 = 6.0;
-const KEY_BAR_HEIGHT: f32 = KEY_BAR_BUTTON + KEY_BAR_GAP + 4.0;
+pub const KEY_BAR_HEIGHT: f32 = KEY_BAR_BUTTON + KEY_BAR_GAP + 4.0;
 
 pub struct Terminal {
     parser: vt100::Parser,
-    rows: u16,
-    cols: u16,
+    pub rows: u16,
+    pub cols: u16,
+    /// Fraction of a line scrolled but not yet applied to the view.
+    scroll_rem: f32,
+    /// `ctx.input(time)` when the session opened; the app shows its age.
+    pub opened_at: Option<f64>,
     tx: WsSender,
     rx: WsReceiver,
     /// Active text selection as (anchor, head) cells, each `(row, col)`.
@@ -25,6 +32,14 @@ pub struct Terminal {
     pub closed: bool,
 }
 
+/// The grid that fits in `area`, for the size a session opens with: what the
+/// shell prints first is wrapped to it, before any resize could reach the agent.
+pub fn grid_for(ctx: &egui::Context, area: egui::Vec2) -> (u16, u16) {
+    let font = FontId::monospace(FONT_SIZE);
+    let (cw, rh) = ctx.fonts(|f| (f.glyph_width(&font, 'M').max(1.0), f.row_height(&font).max(1.0)));
+    (((area.x / cw).floor() as u16).clamp(20, 400), ((area.y / rh).floor() as u16).clamp(5, 200))
+}
+
 impl Terminal {
     /// Dial `wss://<host>/ws/term?...`. `base_ws` is the relay's ws origin.
     pub fn connect(
@@ -32,9 +47,8 @@ impl Terminal {
         agent: &str,
         shell: Option<&str>,
         ctx: &egui::Context,
+        (cols, rows): (u16, u16),
     ) -> Result<Self, String> {
-        let rows: u16 = 24;
-        let cols: u16 = 80;
         let mut url = format!(
             "{base_ws}/ws/term?agent={}&cols={cols}&rows={rows}",
             urlencode(agent)
@@ -52,9 +66,11 @@ impl Terminal {
         .map_err(|e| e.to_string())?;
 
         Ok(Self {
-            parser: vt100::Parser::new(rows, cols, 0),
+            parser: vt100::Parser::new(rows, cols, SCROLLBACK),
             rows,
             cols,
+            scroll_rem: 0.0,
+            opened_at: None,
             tx,
             rx,
             sel: None,
@@ -65,13 +81,23 @@ impl Terminal {
         })
     }
 
-    /// Drain socket events into the screen model.
-    fn pump(&mut self) {
+    /// Lines the view is scrolled back from the live screen.
+    pub fn scrolled_back(&self) -> usize {
+        self.parser.screen().scrollback()
+    }
+
+    /// Drain socket events into the screen model. Runs every frame, shown or not,
+    /// so output arriving while another tab is open is not left queued.
+    pub fn pump(&mut self, now: f64) {
         while let Some(ev) = self.rx.try_recv() {
             match ev {
                 WsEvent::Opened => {
                     self.open = true;
+                    self.opened_at = Some(now);
                     self.status = "connected".to_string();
+                    // The view has usually been resized by now, and the agent
+                    // only knows the size from the connect URL.
+                    self.send_size();
                 }
                 WsEvent::Message(WsMessage::Binary(b)) => self.parser.process(&b),
                 WsEvent::Message(WsMessage::Text(t)) => self.parser.process(t.as_bytes()),
@@ -101,6 +127,10 @@ impl Terminal {
         self.cols = cols.max(2);
         self.rows = rows.max(1);
         self.parser.set_size(self.rows, self.cols);
+        self.send_size();
+    }
+
+    fn send_size(&mut self) {
         if self.open && !self.closed {
             self.tx.send(WsMessage::Text(format!(
                 r#"{{"type":"resize","cols":{},"rows":{}}}"#,
@@ -109,12 +139,19 @@ impl Terminal {
         }
     }
 
-    /// Render the grid and handle keyboard input. Fills the available space.
-    pub fn ui(&mut self, ui: &mut egui::Ui) {
-        self.pump();
+    /// Move the view `lines` into history (positive) or back toward live.
+    fn scroll(&mut self, lines: i32) {
+        let current = self.parser.screen().scrollback() as i32;
+        self.parser.set_scrollback((current + lines).max(0) as usize);
+    }
 
+    /// Render the grid and handle keyboard input. Fills the available space.
+    ///
+    /// `capture_keys` is false while a dialog is open: the terminal must not take
+    /// keyboard focus from the dialog's fields.
+    pub fn ui(&mut self, ui: &mut egui::Ui, capture_keys: bool) {
         let accent = crate::theme::current(ui.ctx()).accent;
-        let font = FontId::monospace(13.0);
+        let font = FontId::monospace(FONT_SIZE);
         let (cw, rh) = ui.fonts(|f| {
             (
                 f.glyph_width(&font, 'M').max(1.0),
@@ -123,7 +160,7 @@ impl Terminal {
         });
 
         let touch = crate::mobile::is_touch();
-        if touch {
+        if touch && capture_keys {
             crate::mobile::text_target(ui.available_rect_before_wrap());
         }
 
@@ -145,7 +182,10 @@ impl Terminal {
         // Drag to select, click to clear. Selection is purely for copy — the
         // agent gets no mouse events. Anchor at the press origin (not the point
         // where egui first recognised the drag) so the whole swipe is covered.
-        if response.dragged() {
+        // On a touch screen a drag is the only way to scroll, so it scrolls.
+        if touch && response.dragged() {
+            self.scroll_rem += response.drag_delta().y / rh;
+        } else if response.dragged() {
             let press = ui.input(|i| i.pointer.press_origin());
             if let (Some(p0), Some(p1)) = (press, response.interact_pointer_pos()) {
                 self.sel = Some((
@@ -159,16 +199,39 @@ impl Terminal {
         }
         // Copy on release (classic terminal "copy on select"), so copying works
         // without a keyboard shortcut; Cmd/Ctrl+C in handle_input also copies.
-        if response.drag_stopped() {
+        if !touch && response.drag_stopped() {
             if let Some(text) = self.selection_text() {
                 if !text.is_empty() {
                     ui.ctx().copy_text(text);
                 }
             }
         }
-        // Always keep focus while a terminal is shown so keystrokes flow.
-        if !response.has_focus() {
-            response.request_focus();
+        if response.hovered() {
+            self.scroll_rem += ui.input(|i| i.smooth_scroll_delta.y) / rh;
+        }
+        let whole = self.scroll_rem.trunc();
+        if whole != 0.0 {
+            self.scroll_rem -= whole;
+            self.scroll(whole as i32);
+        }
+
+        // Keep focus while a terminal is shown so keystrokes flow, and keep
+        // egui from using Tab, arrows and Esc to move focus away.
+        if capture_keys {
+            if !response.has_focus() {
+                response.request_focus();
+            }
+            ui.memory_mut(|m| {
+                m.set_focus_lock_filter(
+                    response.id,
+                    egui::EventFilter {
+                        tab: true,
+                        horizontal_arrows: true,
+                        vertical_arrows: true,
+                        escape: true,
+                    },
+                );
+            });
         }
 
         let sel_norm = self.sel.map(|(a, b)| norm(a, b));
@@ -216,7 +279,7 @@ impl Terminal {
         }
 
         // Cursor.
-        if !screen.hide_cursor() {
+        if !screen.hide_cursor() && screen.scrollback() == 0 {
             let (cr, cc) = screen.cursor_position();
             let x = origin.x + cc as f32 * cw;
             let y = origin.y + cr as f32 * rh;
@@ -229,12 +292,14 @@ impl Terminal {
             painter.rect_filled(cur, 0.0, color.linear_multiply(0.6));
         }
 
-        if touch {
+        if touch && capture_keys {
             // Asks eframe to keep its text agent, the source of the on-screen
             // keyboard's input, focused while the terminal is shown.
             ui.ctx().output_mut(|o| {
                 o.ime = Some(egui::output::IMEOutput { rect, cursor_rect: rect });
             });
+        }
+        if touch {
             self.key_bar(ui);
         }
 
@@ -245,32 +310,37 @@ impl Terminal {
 
     /// The keys a phone keyboard does not have.
     fn key_bar(&mut self, ui: &mut egui::Ui) {
-        let keys: [(&str, &[u8]); 8] = [
-            ("Esc", b"\x1b"),
-            ("Tab", b"\t"),
-            ("^C", b"\x03"),
-            ("^D", b"\x04"),
-            ("\u{2190}", b"\x1b[D"),
-            ("\u{2191}", b"\x1b[A"),
-            ("\u{2193}", b"\x1b[B"),
-            ("\u{2192}", b"\x1b[C"),
+        let p = crate::theme::current(ui.ctx());
+        let keys: [(&str, Option<&[u8]>); 7] = [
+            ("Esc", Some(b"\x1b")),
+            ("Tab", Some(b"\t")),
+            ("Ctrl", None),
+            ("\u{2190}", Some(b"\x1b[D")),
+            ("\u{2191}", Some(b"\x1b[A")),
+            ("\u{2193}", Some(b"\x1b[B")),
+            ("\u{2192}", Some(b"\x1b[C")),
         ];
-        let accent = crate::theme::current(ui.ctx()).accent;
         ui.add_space(KEY_BAR_GAP);
+        let gap = 4.0;
+        let width = (ui.available_width() - gap * (keys.len() as f32 - 1.0)) / keys.len() as f32;
         ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 4.0;
-            let ctrl = egui::Button::new(egui::RichText::new("Ctrl").size(13.0))
-                .fill(if self.ctrl_armed { accent } else { egui::Color32::TRANSPARENT })
-                .min_size(egui::vec2(38.0, KEY_BAR_BUTTON));
-            if ui.add(ctrl).clicked() {
-                self.ctrl_armed = !self.ctrl_armed;
-            }
+            ui.spacing_mut().item_spacing.x = gap;
             for (label, bytes) in keys {
-                let key = egui::Button::new(egui::RichText::new(label).size(13.0))
-                    .fill(egui::Color32::TRANSPARENT)
-                    .min_size(egui::vec2(32.0, KEY_BAR_BUTTON));
+                let armed = bytes.is_none() && self.ctrl_armed;
+                let text = egui::RichText::new(label)
+                    .font(FontId::monospace(13.0))
+                    .color(if armed { p.on_accent } else { p.text });
+                let key = egui::Button::new(text)
+                    .fill(if armed { p.accent } else { p.hover })
+                    .min_size(egui::vec2(width, KEY_BAR_BUTTON));
                 if ui.add(key).clicked() {
-                    self.send_bytes(bytes);
+                    match bytes {
+                        Some(b) => {
+                            self.send_bytes(b);
+                            self.parser.set_scrollback(0);
+                        }
+                        None => self.ctrl_armed = !self.ctrl_armed,
+                    }
                 }
             }
         });
@@ -321,8 +391,9 @@ impl Terminal {
         }
         if !out.is_empty() {
             self.send_bytes(&out);
-            // Typing clears the selection highlight, as a terminal would.
+            // Typing clears the selection and returns to the live screen.
             self.sel = None;
+            self.parser.set_scrollback(0);
         }
     }
 

@@ -20,13 +20,21 @@ mod web {
 
     thread_local! {
         static TARGETS: RefCell<Vec<egui::Rect>> = const { RefCell::new(Vec::new()) };
+        static IS_TOUCH: Cell<Option<bool>> = const { Cell::new(None) };
         static TOUCH_START: Cell<Option<(f32, f32)>> = const { Cell::new(None) };
     }
 
     pub fn is_touch() -> bool {
-        web_sys::window()
-            .and_then(|w| w.match_media("(pointer: coarse)").ok().flatten())
-            .is_some_and(|m| m.matches())
+        IS_TOUCH.with(|c| match c.get() {
+            Some(v) => v,
+            None => {
+                let v = web_sys::window()
+                    .and_then(|w| w.match_media("(pointer: coarse)").ok().flatten())
+                    .is_some_and(|m| m.matches());
+                c.set(Some(v));
+                v
+            }
+        })
     }
 
     pub fn begin_frame() {
