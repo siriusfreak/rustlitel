@@ -17,7 +17,7 @@ rustlitel-proto = { path = "../proto" }
 anyhow = { workspace = true }
 clap = { version = "4", features = ["derive", "env"] }
 ring = "0.17"
-base64 = "0.22"
+base64 = "0.23"
 sha2 = "0.10"
 serde = { workspace = true }
 serde_json = { workspace = true }
