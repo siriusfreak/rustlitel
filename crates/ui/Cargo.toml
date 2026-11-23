@@ -9,7 +9,7 @@ name = "rustlitel-ui"
 path = "src/main.rs"
 
 [dependencies]
-egui = "0.29"
+egui = "0.37"
 # No default_fonts: 1.4 MB of faces the UI does not use (see theme::install_fonts).
 eframe = { version = "0.29", default-features = false, features = [
     "glow",          # WebGL renderer
