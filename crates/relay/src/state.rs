@@ -54,6 +54,8 @@ pub struct AgentConn {
     pub os: String,
     pub shells: Vec<String>,
     pub allow_remote: bool,
+    /// Optional features the agent build understands (see `AgentHello`).
+    pub capabilities: Vec<String>,
     pub connected_at: Instant,
     /// Push commands to the task that owns this agent's control socket.
     pub commands: mpsc::UnboundedSender<ServerToAgent>,
@@ -67,6 +69,7 @@ impl AgentConn {
             os: self.os.clone(),
             shells: self.shells.clone(),
             allow_remote: self.allow_remote,
+            capabilities: self.capabilities.clone(),
             connected_secs: self.connected_at.elapsed().as_secs(),
         }
     }
@@ -118,6 +121,8 @@ pub struct AppState {
     pub open_timeout_secs: u64,
     /// Per-stream output cap (bytes) the relay keeps for an exec result.
     pub exec_output_cap: usize,
+    /// Output cap for a desktop answer (a screenshot is one base64 document).
+    pub desktop_output_cap: usize,
     /// Default exec wall-clock limit when the caller does not specify one.
     pub exec_default_timeout_secs: u64,
     /// Directory holding stock agent binaries to download / bake installers from.

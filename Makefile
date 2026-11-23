@@ -40,7 +40,9 @@ help:
 	@echo "  image            build + push the relay image to the private registry"
 	@echo "  agent-windows    cross-build the Windows agent .exe (needs the target + linker)"
 	@echo "  agent-macos      universal macOS agent into dist/ (macOS host, both targets)"
-	@echo "  cli-macos        universal macOS CLI into dist/ (macOS host, both targets)"
+	@echo "  cli-macos        universal macOS CLI into dist/cli/ (macOS host, both targets)"
+	@echo "  cli-windows      Windows CLI into dist/cli/ (mingw-w64)"
+	@echo "  clis             both; the image adds the Linux one and serves them at /cli"
 	@echo "  update-keygen    generate the ed25519 self-update signing key (one-time)"
 	@echo "  sign-agents      ed25519-sign the dist/ agent binaries for self-update"
 	@echo "  run-relay        run the relay locally (needs RUSTLITEL_OPERATOR_TOKEN, RUSTLITEL_AGENT_TOKEN)"
@@ -120,10 +122,23 @@ cli-macos:
 	for t in $(MACOS_TARGETS); do \
 	  $(CARGO) build --release -p rustlitel-cli --target $$t || exit 1; \
 	done
-	mkdir -p dist
-	lipo -create -output dist/rustlitel-cli-macos $(MACOS_TARGETS:%=target/%/release/rustlitel)
-	codesign --force --sign - dist/rustlitel-cli-macos
-	@echo "-> dist/rustlitel-cli-macos"
+	mkdir -p dist/cli
+	lipo -create -output dist/cli/rustlitel-macos $(MACOS_TARGETS:%=target/%/release/rustlitel)
+	codesign --force --sign - dist/cli/rustlitel-macos
+	@echo "-> dist/cli/rustlitel-macos"
+
+# Windows CLI, cross-built like agent-windows (x86_64-pc-windows-gnu + mingw-w64).
+.PHONY: cli-windows
+cli-windows:
+	$(CARGO) build --release -p rustlitel-cli --target x86_64-pc-windows-gnu
+	mkdir -p dist/cli
+	cp target/x86_64-pc-windows-gnu/release/rustlitel.exe dist/cli/rustlitel-windows-amd64.exe
+	@echo "-> dist/cli/rustlitel-windows-amd64.exe"
+
+# The CLI for every platform. The relay serves dist/cli/ publicly at /cli; the
+# Linux one (static, musl) is built inside the image by the Dockerfile.
+.PHONY: clis
+clis: cli-macos cli-windows
 
 # One-time: generate the ed25519 self-update signing key. Store the PRIVATE key
 # in 1Password at UPDATE_SIGNING_KEY_REF and put UPDATE_PUBKEY in Makefile.local.

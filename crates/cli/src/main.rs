@@ -44,6 +44,130 @@ enum Cmd {
         #[arg(long)]
         timeout: Option<u64>,
     },
+    /// Logon sessions on a Windows agent (console, RDP); pick one with --session.
+    Sessions {
+        agent: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// List the open windows on a Windows agent.
+    Windows {
+        agent: String,
+        /// Include hidden, untitled and tool windows.
+        #[arg(long)]
+        all: bool,
+        /// Print the agent's JSON (windows + monitors) instead of a table.
+        #[arg(long)]
+        json: bool,
+        /// Session id (see `sessions`); default: console, else the active RDP one.
+        #[arg(long)]
+        session: Option<u32>,
+    },
+    /// Take a screenshot of the screen, one monitor, or one window.
+    Screenshot {
+        agent: String,
+        /// Output file; default <agent>-<time>.<png|jpg>. `-` writes to stdout.
+        #[arg(short, long)]
+        out: Option<String>,
+        #[command(flatten)]
+        target: Target,
+        /// 0-based monitor (`windows --json` lists them); default all monitors.
+        #[arg(long)]
+        monitor: Option<u32>,
+        /// png (default) or jpeg.
+        #[arg(long)]
+        format: Option<String>,
+        /// JPEG quality 1-100.
+        #[arg(long)]
+        quality: Option<u8>,
+        /// Downscale to at most this width.
+        #[arg(long)]
+        max_width: Option<u32>,
+        /// Session id (see `sessions`); default: console, else the active RDP one.
+        #[arg(long, conflicts_with = "all_sessions")]
+        session: Option<u32>,
+        /// One screenshot per session that has a user logged on (files get `-s<id>`).
+        #[arg(long)]
+        all_sessions: bool,
+    },
+    /// Act on a window: focus, minimize, maximize, restore, move, close.
+    Window {
+        agent: String,
+        #[arg(value_enum)]
+        op: Op,
+        #[command(flatten)]
+        target: Target,
+        /// For `move`: new left edge / top edge / width / height (pixels).
+        #[arg(long, allow_negative_numbers = true)]
+        x: Option<i32>,
+        #[arg(long, allow_negative_numbers = true)]
+        y: Option<i32>,
+        #[arg(long)]
+        width: Option<i32>,
+        #[arg(long)]
+        height: Option<i32>,
+        #[arg(long)]
+        session: Option<u32>,
+    },
+}
+
+/// Which window. Title and process are case-insensitive substrings; exactly
+/// one window may match.
+#[derive(clap::Args, Default)]
+struct Target {
+    /// Window handle from `windows` (decimal or 0x hex).
+    #[arg(long, value_parser = parse_hwnd)]
+    hwnd: Option<u64>,
+    /// Part of the window title.
+    #[arg(long)]
+    title: Option<String>,
+    /// Part of the process name, e.g. notepad.exe.
+    #[arg(long)]
+    process: Option<String>,
+    #[arg(long)]
+    pid: Option<u32>,
+}
+
+impl Target {
+    fn json(&self) -> Option<serde_json::Value> {
+        if self.hwnd.is_none() && self.title.is_none() && self.process.is_none() && self.pid.is_none() {
+            return None;
+        }
+        Some(serde_json::json!({
+            "hwnd": self.hwnd, "title": self.title, "process": self.process, "pid": self.pid,
+        }))
+    }
+}
+
+fn parse_hwnd(s: &str) -> Result<u64, String> {
+    let r = match s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        Some(h) => u64::from_str_radix(h, 16),
+        None => s.parse(),
+    };
+    r.map_err(|e| e.to_string())
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum Op {
+    Focus,
+    Minimize,
+    Maximize,
+    Restore,
+    Move,
+    Close,
+}
+
+impl Op {
+    fn name(self) -> &'static str {
+        match self {
+            Op::Focus => "focus",
+            Op::Minimize => "minimize",
+            Op::Maximize => "maximize",
+            Op::Restore => "restore",
+            Op::Move => "move",
+            Op::Close => "close",
+        }
+    }
 }
 
 fn now() -> u64 {
@@ -397,6 +521,269 @@ async fn exec(
     Ok(r.exit_code.unwrap_or(1))
 }
 
+// --- desktop ---------------------------------------------------------------
+
+/// POST /api/desktop and return the agent's `{"ok":true,...}` document, or
+/// fail with its error.
+async fn desktop(relay: &str, agent: &str, mut body: serde_json::Value) -> Result<serde_json::Value> {
+    let tok = access_token(relay).await?;
+    body["agent"] = serde_json::Value::String(agent.to_string());
+    let resp = reqwest::Client::new()
+        .post(format!("{relay}/api/desktop"))
+        .bearer_auth(tok)
+        .json(&body)
+        .send()
+        .await?;
+    let status = resp.status();
+    let text = resp.text().await?;
+    let v: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|_| anyhow!("relay returned {status}: {}", text.trim()))?;
+    if v.get("ok").and_then(|x| x.as_bool()) != Some(true) {
+        let e = v.get("error").and_then(|x| x.as_str()).unwrap_or("unknown error");
+        bail!("{e}");
+    }
+    if let Some(w) = v.get("warning").and_then(|x| x.as_str()) {
+        eprintln!("warning: {w}");
+    }
+    Ok(v)
+}
+
+fn s<'a>(v: &'a serde_json::Value, k: &str) -> &'a str {
+    v.get(k).and_then(|x| x.as_str()).unwrap_or("")
+}
+fn n(v: &serde_json::Value, k: &str) -> i64 {
+    v.get(k).and_then(|x| x.as_i64()).unwrap_or(0)
+}
+fn b(v: &serde_json::Value, k: &str) -> bool {
+    v.get(k).and_then(|x| x.as_bool()).unwrap_or(false)
+}
+
+fn print_window(w: &serde_json::Value) {
+    let mut flags = Vec::new();
+    if b(w, "foreground") {
+        flags.push("fg");
+    }
+    if b(w, "minimized") {
+        flags.push("min");
+    }
+    if b(w, "maximized") {
+        flags.push("max");
+    }
+    if !b(w, "visible") {
+        flags.push("hidden");
+    }
+    if b(w, "cloaked") {
+        flags.push("cloaked");
+    }
+    let mut title: String = s(w, "title").chars().take(60).collect();
+    if title.is_empty() {
+        title = format!("[{}]", s(w, "class"));
+    }
+    println!(
+        "{:<12} {:<7} {:<22} {:>6},{:<6} {:>5}x{:<5} {:<11} {}",
+        format!("0x{:x}", n(w, "hwnd")),
+        n(w, "pid"),
+        s(w, "process").chars().take(22).collect::<String>(),
+        n(w, "x"),
+        n(w, "y"),
+        n(w, "width"),
+        n(w, "height"),
+        flags.join(","),
+        title
+    );
+}
+
+async fn sessions_cmd(relay: &str, agent: &str, json: bool) -> Result<()> {
+    let v = desktop(relay, agent, serde_json::json!({"action": "sessions"})).await?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&v["sessions"])?);
+        return Ok(());
+    }
+    println!("{:<5} {:<16} {:<22} {:<13} NOTE", "ID", "STATION", "USER", "STATE");
+    for x in v["sessions"].as_array().into_iter().flatten() {
+        let mut note = Vec::new();
+        if b(x, "console") {
+            note.push("console");
+        }
+        if b(x, "default") {
+            note.push("default");
+        }
+        println!(
+            "{:<5} {:<16} {:<22} {:<13} {}",
+            n(x, "id"),
+            s(x, "name"),
+            s(x, "user"),
+            s(x, "state"),
+            note.join(",")
+        );
+    }
+    Ok(())
+}
+
+async fn windows_cmd(relay: &str, agent: &str, all: bool, json: bool, session: Option<u32>) -> Result<()> {
+    let v = desktop(
+        relay,
+        agent,
+        serde_json::json!({"action": "list_windows", "all": all, "session": session}),
+    )
+    .await?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&v)?);
+        return Ok(());
+    }
+    println!(
+        "session {} ({}), monitors: {}",
+        n(&v, "session"),
+        s(&v, "session_user"),
+        v["monitors"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|m| format!("#{} {}x{}@{},{}", n(m, "index"), n(m, "width"), n(m, "height"), n(m, "x"), n(m, "y")))
+            .collect::<Vec<_>>()
+            .join("  ")
+    );
+    println!(
+        "{:<12} {:<7} {:<22} {:>13} {:<11} {:<11} TITLE",
+        "HWND", "PID", "PROCESS", "POSITION", "SIZE", "STATE"
+    );
+    for w in v["windows"].as_array().into_iter().flatten() {
+        print_window(w);
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn screenshot_cmd(
+    relay: &str,
+    agent: &str,
+    out: Option<String>,
+    target: &Target,
+    monitor: Option<u32>,
+    format: Option<String>,
+    quality: Option<u8>,
+    max_width: Option<u32>,
+    session: Option<u32>,
+    all_sessions: bool,
+) -> Result<()> {
+    let mut req = serde_json::json!({
+        "action": "screenshot", "window": target.json(), "monitor": monitor,
+        "format": format, "quality": quality, "max_width": max_width,
+        "timeout_secs": 120,
+    });
+    let sessions: Vec<Option<u32>> = if all_sessions {
+        let v = desktop(relay, agent, serde_json::json!({"action": "sessions"})).await?;
+        let ids: Vec<Option<u32>> = v["sessions"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|x| !s(x, "user").is_empty())
+            .map(|x| Some(n(x, "id") as u32))
+            .collect();
+        if ids.is_empty() {
+            bail!("nobody is logged on to {agent}");
+        }
+        ids
+    } else {
+        vec![session]
+    };
+    let mut failed = 0;
+    for sess in &sessions {
+        req["session"] = serde_json::json!(sess);
+        let v = match desktop(relay, agent, req.clone()).await {
+            Ok(v) => v,
+            Err(e) if all_sessions => {
+                eprintln!("session {}: {e:#}", sess.unwrap_or(0));
+                failed += 1;
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+        use base64::Engine;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(s(&v, "data"))
+            .context("decode the image")?;
+        let ext = if s(&v, "format") == "jpeg" { "jpg" } else { "png" };
+        let path = match (&out, all_sessions) {
+            (Some(o), _) if o == "-" => {
+                use std::io::Write;
+                std::io::stdout().write_all(&bytes)?;
+                continue;
+            }
+            (Some(o), false) => o.clone(),
+            (Some(o), true) => {
+                let p = std::path::Path::new(o);
+                let stem = p.file_stem().and_then(|x| x.to_str()).unwrap_or("screenshot");
+                let e = p.extension().and_then(|x| x.to_str()).unwrap_or(ext);
+                p.with_file_name(format!("{stem}-s{}.{e}", n(&v, "session")))
+                    .to_string_lossy()
+                    .into_owned()
+            }
+            (None, _) => {
+                let suffix = if all_sessions { format!("-s{}", n(&v, "session")) } else { String::new() };
+                format!("{agent}-{}{suffix}.{ext}", now())
+            }
+        };
+        std::fs::write(&path, &bytes).with_context(|| format!("write {path}"))?;
+        let what = match v.get("window") {
+            Some(w) => format!("window {:?}", s(w, "title")),
+            None => "screen".into(),
+        };
+        eprintln!(
+            "{path}: {}x{} {}, {what}, session {} ({})",
+            n(&v, "width"),
+            n(&v, "height"),
+            s(&v, "format"),
+            n(&v, "session"),
+            s(&v, "session_user")
+        );
+    }
+    if failed == sessions.len() {
+        bail!("no session could be captured");
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn window_cmd(
+    relay: &str,
+    agent: &str,
+    op: Op,
+    target: &Target,
+    x: Option<i32>,
+    y: Option<i32>,
+    width: Option<i32>,
+    height: Option<i32>,
+    session: Option<u32>,
+) -> Result<()> {
+    let t = target
+        .json()
+        .ok_or_else(|| anyhow!("say which window: --hwnd, --title, --process or --pid"))?;
+    let v = desktop(
+        relay,
+        agent,
+        serde_json::json!({
+            "action": "window", "op": op.name(), "target": t,
+            "x": x, "y": y, "width": width, "height": height, "session": session,
+        }),
+    )
+    .await?;
+    if let Some(closed) = v.get("closed").and_then(|c| c.as_bool()) {
+        println!("{}", if closed { "closed" } else { "still open" });
+        if let Some(note) = v.get("note").and_then(|x| x.as_str()) {
+            eprintln!("{note}");
+        }
+        return Ok(());
+    }
+    if let Some(w) = v.get("window") {
+        print_window(w);
+    }
+    if matches!(op, Op::Focus) && !b(&v, "foreground") {
+        eprintln!("note: Windows did not move it to the foreground (someone may be using the machine)");
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -442,6 +829,44 @@ async fn main() -> Result<()> {
             let relay = resolve_relay(cli.relay)?;
             let code = exec(&relay, &agent, &command.join(" "), shell, timeout).await?;
             std::process::exit(code);
+        }
+        Cmd::Sessions { agent, json } => {
+            let relay = resolve_relay(cli.relay)?;
+            sessions_cmd(&relay, &agent, json).await?;
+        }
+        Cmd::Windows { agent, all, json, session } => {
+            let relay = resolve_relay(cli.relay)?;
+            windows_cmd(&relay, &agent, all, json, session).await?;
+        }
+        Cmd::Screenshot {
+            agent,
+            out,
+            target,
+            monitor,
+            format,
+            quality,
+            max_width,
+            session,
+            all_sessions,
+        } => {
+            let relay = resolve_relay(cli.relay)?;
+            screenshot_cmd(
+                &relay, &agent, out, &target, monitor, format, quality, max_width, session, all_sessions,
+            )
+            .await?;
+        }
+        Cmd::Window {
+            agent,
+            op,
+            target,
+            x,
+            y,
+            width,
+            height,
+            session,
+        } => {
+            let relay = resolve_relay(cli.relay)?;
+            window_cmd(&relay, &agent, op, &target, x, y, width, height, session).await?;
         }
     }
     Ok(())

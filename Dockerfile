@@ -10,7 +10,7 @@
 
 FROM rust:1-bookworm AS build
 RUN apt-get update \
- && apt-get install -y --no-install-recommends cmake \
+ && apt-get install -y --no-install-recommends cmake musl-tools \
  && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 # Build identifier baked into relay + agent (see crates/proto/build.rs). Passed
@@ -34,11 +34,16 @@ COPY crates ./crates
 # is a cache mount, so copy the binary out before the stage ends.
 # Build the relay AND the Linux agent (glibc) in one go; the macOS and Windows
 # agent binaries are cross-built out-of-band and dropped into dist/.
+# The operator CLI for Linux too, static (musl), served publicly at /cli.
+RUN rustup target add x86_64-unknown-linux-musl
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
     cargo build --release -p rustlitel-relay -p rustlitel-agent && \
+    CC_x86_64_unknown_linux_musl=musl-gcc \
+      cargo build --release -p rustlitel-cli --target x86_64-unknown-linux-musl && \
     cp target/release/rustlitel-relay /rustlitel-relay && \
-    cp target/release/rustlitel-agent /rustlitel-agent-linux
+    cp target/release/rustlitel-agent /rustlitel-agent-linux && \
+    cp target/x86_64-unknown-linux-musl/release/rustlitel /rustlitel-cli-linux
 
 FROM gcr.io/distroless/cc-debian12:nonroot
 COPY --from=build /rustlitel-relay /rustlitel-relay
@@ -46,6 +51,7 @@ COPY --from=build /rustlitel-relay /rustlitel-relay
 # Linux (built above), macOS + Windows (dist/, cross-built out-of-band).
 COPY --from=build /rustlitel-agent-linux /srv/agents/rustlitel-agent-linux
 COPY dist/ /srv/agents/
+COPY --from=build /rustlitel-cli-linux /srv/agents/cli/rustlitel-linux-amd64
 # Compiled egui/WASM UI bundle (built out-of-band by `make ui` into
 # crates/ui/dist; served from RUSTLITEL_UI_DIR, default /srv/ui).
 COPY crates/ui/dist/ /srv/ui/

@@ -80,7 +80,16 @@ pub struct AgentHello {
     /// but will decline every session. Lets the operator see *why* nothing
     /// opens instead of staring at a silent timeout.
     pub allow_remote: bool,
+    /// Optional features this build understands beyond shells and exec, e.g.
+    /// [`CAP_DESKTOP`]. Absent in older agents, so the relay can refuse a
+    /// command they would silently drop instead of waiting for a timeout.
+    #[serde(default)]
+    pub capabilities: Vec<String>,
 }
+
+/// Capability: the agent answers [`ServerToAgent::Desktop`] (screenshots and
+/// window management in the interactive user's session).
+pub const CAP_DESKTOP: &str = "desktop";
 
 /// Commands the relay pushes to the agent over the control link (JSON text).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -114,12 +123,109 @@ pub enum ServerToAgent {
         /// Hard wall-clock limit; the agent kills the process when it elapses.
         timeout_secs: u64,
     },
+    /// Look at or act on the interactive desktop: screenshots, the window list,
+    /// focus/minimize/move/close a window. Answered like an exec: the result
+    /// is one JSON document (see [`DesktopRequest`]) sent as stdout
+    /// [`ExecChunk`](AgentToServer::ExecChunk)s, then an
+    /// [`ExecDone`](AgentToServer::ExecDone) with the same id. Gated by
+    /// `--allow-remote` like exec. Only agents that list [`CAP_DESKTOP`] in
+    /// their hello understand it.
+    Desktop {
+        exec_id: Uuid,
+        request: DesktopRequest,
+        /// Windows session to act in (`sessions` lists them). `None`: the
+        /// console session if a user is logged on there, else the first
+        /// active (e.g. RDP) session.
+        #[serde(default)]
+        session: Option<u32>,
+        timeout_secs: u64,
+    },
     /// Self-delete: the agent uninstalls itself (on Windows: stop + delete the
     /// service and remove its installed copy) and exits. Triggered by the
     /// operator's "uninstall" button.
     Uninstall,
     /// Liveness probe; the agent answers [`AgentToServer::Pong`].
     Ping,
+}
+
+/// What a [`ServerToAgent::Desktop`] asks for. The agent answers with a JSON
+/// object: `{"ok":true, ...}` with the fields named below, or
+/// `{"ok":false,"error":"..."}`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum DesktopRequest {
+    /// Logon sessions on the machine: `{"sessions":[{id,name,user,state,console}]}`.
+    Sessions,
+    /// Top-level windows: `{"session":n,"windows":[WindowInfo...]}`. Without
+    /// `all`, only visible, titled, uncloaked windows (what the taskbar shows,
+    /// roughly).
+    ListWindows {
+        #[serde(default)]
+        all: bool,
+    },
+    /// Capture the screen, one monitor, or one window:
+    /// `{"format":"png","width":w,"height":h,"data":"<base64>","window":{...}?}`.
+    Screenshot {
+        /// Capture this window (rendered even if covered by others).
+        #[serde(default)]
+        window: Option<WindowTarget>,
+        /// 0-based monitor index; `None` = every monitor (the virtual screen).
+        #[serde(default)]
+        monitor: Option<u32>,
+        /// "png" (default) or "jpeg".
+        #[serde(default)]
+        format: Option<String>,
+        /// JPEG quality 1-100 (default 80).
+        #[serde(default)]
+        quality: Option<u8>,
+        /// Downscale so the image is at most this many pixels wide.
+        #[serde(default)]
+        max_width: Option<u32>,
+    },
+    /// Act on one window: `{"window":WindowInfo,"foreground":bool}` after the
+    /// action (no `window` after `close` if it went away).
+    Window {
+        target: WindowTarget,
+        op: WindowOp,
+        /// For `move`: new position / size; a missing value keeps the current one.
+        #[serde(default)]
+        x: Option<i32>,
+        #[serde(default)]
+        y: Option<i32>,
+        #[serde(default)]
+        width: Option<i32>,
+        #[serde(default)]
+        height: Option<i32>,
+    },
+}
+
+/// Which window: every given field must match, and exactly one window may
+/// match (else the answer is an error listing the candidates). `title` and
+/// `process` are case-insensitive substrings; `hwnd` alone is exact.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WindowTarget {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hwnd: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WindowOp {
+    /// Restore if minimized and bring to the foreground.
+    Focus,
+    Minimize,
+    Maximize,
+    Restore,
+    /// Move and/or resize (`x`, `y`, `width`, `height`).
+    Move,
+    /// Ask the window to close (WM_CLOSE): the app may still prompt to save.
+    Close,
 }
 
 /// Which captured stream an [`ExecChunk`](AgentToServer::ExecChunk) carries.
@@ -195,6 +301,9 @@ pub struct AgentInfo {
     pub os: String,
     pub shells: Vec<String>,
     pub allow_remote: bool,
+    /// See [`AgentHello::capabilities`].
+    #[serde(default)]
+    pub capabilities: Vec<String>,
     /// Seconds since the agent connected.
     pub connected_secs: u64,
 }

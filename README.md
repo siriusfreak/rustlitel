@@ -18,7 +18,12 @@ Nothing listens for inbound connections on the target side.
 Ways to use it:
 
 * **Interactive terminal** in the browser (egui/WASM) — for a human.
-* **`rustlitel` CLI** — `login` (Keycloak device flow), `agents`, `exec`.
+* **`rustlitel` CLI** — `login` (Keycloak device flow), `agents`, `exec`, and on
+  Windows agents `sessions`, `windows`, `screenshot`, `window`. Download it from
+  the relay itself at `/cli`.
+* **`POST /api/desktop`** — screenshots (screen, monitor or window, any logged-on
+  session) and window management (list, focus, minimize, maximize, restore,
+  move/resize, close).
 * **`POST /api/exec`** — one command in, `stdout`/`stderr`/exit code out. The
   primitive a script or an LLM session uses to inspect and fix the machine.
 
@@ -79,7 +84,7 @@ mingw-w64 linker, then `make agent-windows`.
 ### macOS binaries
 
 `make agent-macos cli-macos` builds universal (arm64 + x86_64) binaries into
-`dist/`, from where the image serves them. On macOS the agent runs in the
+`dist/`, from where the image serves them (the CLI from `dist/cli/`). On macOS the agent runs in the
 foreground and asks for consent on the console; there is no launchd `install`.
 
 ---
@@ -112,6 +117,7 @@ Open <http://127.0.0.1:8099>, sign in with the operator token.
 | `RUSTLITEL_OPEN_TIMEOUT_SECS` | `30` | how long to wait for an agent to accept a session |
 | `RUSTLITEL_EXEC_DEFAULT_TIMEOUT_SECS` | `120` | default exec timeout |
 | `RUSTLITEL_EXEC_OUTPUT_CAP` | `1048576` | per-stream output cap (bytes) |
+| `RUSTLITEL_DESKTOP_OUTPUT_CAP` | `33554432` | cap on one desktop answer (a base64 screenshot) |
 | `RUSTLITEL_AGENTS_DIR` | `/srv/agents` | dir of stock agent binaries (downloads / installer baking) |
 
 **Operator SSO via Keycloak (optional).** Set all four to turn the browser login
@@ -196,6 +202,39 @@ curl -s $RELAY/api/exec -H "Authorization: Bearer $OP" \
 `shell` is optional (`powershell` | `cmd` | `pwsh` on Windows; `bash` | `sh` |
 `zsh` on Unix). This is enough for an operator's Claude session to loop:
 run a diagnostic, read the structured result, decide, run a fix, verify.
+
+### Desktop API (Windows agents)
+
+The installed agent is a service in session 0, which has no screen. For a
+desktop request it starts a copy of itself (`desktop-helper`, still
+LocalSystem) inside a user's session, so it sees what that user sees and can act
+on elevated windows too. By default that is the console session when someone is
+logged on there, else the active RDP session; `"session": <id>` picks any
+session with a user (`"action":"sessions"` lists them). A disconnected session is
+not drawn by Windows: its screenshot comes back black, with a `warning`.
+
+```bash
+curl -s $RELAY/api/desktop -H "Authorization: Bearer $OP" -H 'Content-Type: application/json' \
+  -d '{"agent":"win-box","action":"list_windows"}'
+curl -s $RELAY/api/desktop -H "Authorization: Bearer $OP" -H 'Content-Type: application/json' \
+  -d '{"agent":"win-box","action":"screenshot","format":"jpeg","max_width":1600}' | jq -r .data | base64 -d > s.jpg
+curl -s $RELAY/api/desktop -H "Authorization: Bearer $OP" -H 'Content-Type: application/json' \
+  -d '{"agent":"win-box","action":"window","op":"move","target":{"title":"Notepad"},"x":0,"y":0,"width":800,"height":600}'
+```
+
+Actions: `sessions`; `list_windows` (`all`); `screenshot` (`window` target,
+`monitor`, `format` png|jpeg, `quality`, `max_width`); `window` with `op`
+focus|minimize|maximize|restore|move|close and a `target` of `hwnd`, `title`,
+`process` and/or `pid` (substrings, must match one window). Every answer is
+`{"ok":true,…}` or `{"ok":false,"error":…}`. Agents built before this report
+501 until they self-update.
+
+### CLI downloads
+
+`GET /cli` is a public page with the CLI for macOS (universal), Linux (static
+x86-64) and Windows, and `GET /cli/<file>` the binaries. Public on purpose: the
+CLI holds no key, token or address, and does nothing without a Keycloak login
+that has the operator role. Agent installers stay behind auth (they carry join keys).
 
 ---
 

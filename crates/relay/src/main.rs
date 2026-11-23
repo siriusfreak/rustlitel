@@ -47,6 +47,9 @@ async fn main() -> anyhow::Result<()> {
     let exec_default_timeout_secs: u64 = env_or("RUSTLITEL_EXEC_DEFAULT_TIMEOUT_SECS", "120")
         .parse()
         .unwrap_or(120);
+    let desktop_output_cap: usize = env_or("RUSTLITEL_DESKTOP_OUTPUT_CAP", "33554432")
+        .parse()
+        .unwrap_or(33_554_432);
     let agents_dir = env_or("RUSTLITEL_AGENTS_DIR", "/srv/agents");
     let ui_dir = env_or("RUSTLITEL_UI_DIR", "/srv/ui");
     let short_link_ttl_days: u64 = env_or("RUSTLITEL_SHORT_LINK_TTL_DAYS", "30").parse().unwrap_or(30);
@@ -115,6 +118,7 @@ async fn main() -> anyhow::Result<()> {
         open_timeout_secs,
         exec_output_cap,
         exec_default_timeout_secs,
+        desktop_output_cap,
         agents_dir,
         ui_dir,
         oidc,
@@ -132,6 +136,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/oauth2/logout", get(handlers::oidc_logout))
         .route("/api/agents", get(handlers::list_agents))
         .route("/api/exec", post(handlers::exec))
+        .route("/api/desktop", post(handlers::desktop))
         .route("/api/uninstall", post(handlers::uninstall_agent))
         .route("/api/installer", post(handlers::make_installer))
         .route("/installer", get(handlers::download_installer))
@@ -140,6 +145,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/agent/update", get(handlers::agent_update))
         .route("/api/agent/binary", get(handlers::agent_binary))
         .route("/download/:file", get(handlers::download))
+        // The operator CLI: public, it holds no secret (see handlers::cli_page).
+        .route("/cli", get(handlers::cli_page))
+        .route("/cli/", get(handlers::cli_page))
+        .route("/cli/:file", get(handlers::cli_download))
         .route("/ws/term", get(handlers::term_ws))
         .route("/ws/agent/control", get(handlers::agent_control_ws))
         .route("/ws/agent/session", get(handlers::agent_session_ws))

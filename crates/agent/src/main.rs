@@ -8,6 +8,8 @@
 //!                    service for UNATTENDED access
 //!   `uninstall`      Windows: stop and remove that service
 //!   `service`        Windows: SCM entry point (used by the service itself)
+//!   `desktop-helper` Windows: one screenshot / window request, run by the
+//!                    agent itself inside the user's session
 //!
 //! Consent, from weakest to strongest:
 //!   * without `--allow-remote` the agent connects and is listed, but declines
@@ -18,6 +20,7 @@
 //!   * `--confirm` (foreground only) additionally requires an interactive y/N
 //!     in the console for every interactive session.
 
+mod desktop;
 mod embedded;
 mod exec;
 mod platform;
@@ -52,6 +55,15 @@ enum Cmd {
     /// Windows: service entry point (invoked by the Service Control Manager).
     #[command(hide = true)]
     Service,
+    /// Windows: does one desktop request inside a user's session (started by
+    /// the agent itself; see `desktop`).
+    #[command(hide = true)]
+    DesktopHelper {
+        #[arg(long)]
+        request: String,
+        #[arg(long)]
+        out: std::path::PathBuf,
+    },
 }
 
 /// Shared configuration. relay/token are optional here so `uninstall` can run
@@ -132,6 +144,10 @@ fn main() {
             // The SCM dispatcher manages its own lifecycle; it builds the tokio
             // runtime internally.
             platform::run_service(cli.run);
+        }
+        Some(Cmd::DesktopHelper { request, out }) => {
+            // No logging: nobody reads this process's output.
+            std::process::exit(desktop::helper_main(&request, &out));
         }
         Some(Cmd::Run) => {
             init_logging();
@@ -328,6 +344,11 @@ async fn run_control(
         os: os_string(),
         shells: shells.to_vec(),
         allow_remote: args.allow_remote,
+        capabilities: if desktop::SUPPORTED {
+            vec![rustlitel_proto::CAP_DESKTOP.to_string()]
+        } else {
+            vec![]
+        },
     };
     ws_sink
         .send(Message::Text(serde_json::to_string(&hello)?))
@@ -438,6 +459,18 @@ fn dispatch(
             let ctl_tx = ctl_tx.clone();
             tokio::spawn(async move {
                 exec::run(allow, &shells, exec_id, command, shell, timeout_secs, ctl_tx).await;
+            });
+        }
+        ServerToAgent::Desktop {
+            exec_id,
+            request,
+            session,
+            timeout_secs,
+        } => {
+            let allow = args.allow_remote;
+            let ctl_tx = ctl_tx.clone();
+            tokio::spawn(async move {
+                desktop::run(allow, exec_id, request, session, timeout_secs, ctl_tx).await;
             });
         }
     }

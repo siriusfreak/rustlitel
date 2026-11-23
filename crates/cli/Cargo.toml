@@ -16,3 +16,4 @@ serde_json = { workspace = true }
 clap = { version = "4", features = ["derive", "env"] }
 anyhow = { workspace = true }
 dirs = "5"
+base64 = "0.22"

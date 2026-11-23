@@ -406,7 +406,33 @@ pub async fn exec(
         return (StatusCode::SERVICE_UNAVAILABLE, "agent disconnected").into_response();
     }
 
-    let cap = state.exec_output_cap;
+    let out = collect_exec(&mut rx, timeout, state.exec_output_cap).await;
+    let (stdout, stderr, truncated, exit_code, error) =
+        (out.stdout, out.stderr, out.truncated, out.exit_code, out.error);
+
+    state.execs.lock().await.remove(&exec_id);
+    Json(ExecResp {
+        exit_code,
+        stdout,
+        stderr,
+        truncated,
+        error,
+    })
+    .into_response()
+}
+
+/// What came back for one exec id.
+struct Collected {
+    stdout: String,
+    stderr: String,
+    truncated: bool,
+    exit_code: Option<i32>,
+    error: Option<String>,
+}
+
+/// Gather the chunks of one exec (or desktop request) until its Done frame,
+/// the agent going away, or `timeout` (+15 s for the final frame).
+async fn collect_exec(rx: &mut mpsc::Receiver<ExecEvent>, timeout: u64, cap: usize) -> Collected {
     let mut stdout = String::new();
     let mut stderr = String::new();
     let mut truncated = false;
@@ -438,16 +464,174 @@ pub async fn exec(
             }
         }
     };
+    Collected { stdout, stderr, truncated, exit_code, error }
+}
 
+// ---------------------------------------------------------------------------
+// Desktop: screenshots and windows on the agent's interactive session
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+pub struct DesktopReq {
+    agent: String,
+    #[serde(default)]
+    session: Option<u32>,
+    #[serde(default)]
+    timeout_secs: Option<u64>,
+    #[serde(flatten)]
+    request: rustlitel_proto::DesktopRequest,
+}
+
+/// Screenshots and window management on an agent, same auth as `/api/exec`.
+/// The body is `{"agent":…, "action":…, …}` (fields of
+/// [`rustlitel_proto::DesktopRequest`] flattened in); the answer is the agent's
+/// JSON document as is: `{"ok":true,…}` or `{"ok":false,"error":…}`.
+///
+/// ```text
+/// curl -s $RELAY/api/desktop -H "Authorization: Bearer $TOKEN" \
+///   -H 'Content-Type: application/json' \
+///   -d '{"agent":"win-box","action":"screenshot","format":"jpeg"}'
+/// ```
+pub async fn desktop(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<DesktopReq>,
+) -> Response {
+    if !api_authed(&state, &headers).await {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    if !csrf_ok(&state, &headers) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let commands = {
+        let agents = state.agents.lock().await;
+        match agents.get(&req.agent) {
+            Some(c) if !c.allow_remote => {
+                return desktop_error(
+                    StatusCode::FORBIDDEN,
+                    "agent has remote access disabled (started without --allow-remote)",
+                );
+            }
+            Some(c) if !c.capabilities.iter().any(|x| x == rustlitel_proto::CAP_DESKTOP) => {
+                return desktop_error(
+                    StatusCode::NOT_IMPLEMENTED,
+                    "this agent's build has no desktop commands; it picks up the new build \
+                     by self-update (or reinstall it)",
+                );
+            }
+            Some(c) => c.commands.clone(),
+            None => return desktop_error(StatusCode::NOT_FOUND, "agent not connected"),
+        }
+    };
+
+    let exec_id = Uuid::new_v4();
+    let timeout = req.timeout_secs.unwrap_or(60).clamp(1, 600);
+    let (tx, mut rx) = mpsc::channel::<ExecEvent>(256);
+    state.execs.lock().await.insert(exec_id, tx);
+    if commands
+        .send(ServerToAgent::Desktop {
+            exec_id,
+            request: req.request,
+            session: req.session,
+            timeout_secs: timeout,
+        })
+        .is_err()
+    {
+        state.execs.lock().await.remove(&exec_id);
+        return desktop_error(StatusCode::SERVICE_UNAVAILABLE, "agent disconnected");
+    }
+    let out = collect_exec(&mut rx, timeout, state.desktop_output_cap).await;
     state.execs.lock().await.remove(&exec_id);
-    Json(ExecResp {
-        exit_code,
-        stdout,
-        stderr,
-        truncated,
-        error,
-    })
-    .into_response()
+
+    if out.truncated {
+        return desktop_error(
+            StatusCode::BAD_GATEWAY,
+            "the answer exceeded RUSTLITEL_DESKTOP_OUTPUT_CAP; ask for jpeg or a smaller max_width",
+        );
+    }
+    let body = out.stdout.trim();
+    if body.starts_with('{') {
+        return ([(header::CONTENT_TYPE, "application/json")], body.to_string()).into_response();
+    }
+    let mut msg = out.error.unwrap_or_else(|| "the agent returned no answer".into());
+    if !out.stderr.trim().is_empty() {
+        msg = format!("{msg}: {}", out.stderr.trim());
+    }
+    desktop_error(StatusCode::BAD_GATEWAY, &msg)
+}
+
+fn desktop_error(status: StatusCode, msg: &str) -> Response {
+    (status, Json(serde_json::json!({ "ok": false, "error": msg }))).into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Operator CLI downloads (public)
+// ---------------------------------------------------------------------------
+
+/// The CLI builds, `(file, label)`, as staged in `<agents_dir>/cli/`.
+const CLI_FILES: &[(&str, &str)] = &[
+    ("rustlitel-macos", "macOS, Apple Silicon and Intel (universal)"),
+    ("rustlitel-linux-amd64", "Linux x86-64 (static)"),
+    ("rustlitel-windows-amd64.exe", "Windows x64"),
+];
+
+/// `GET /cli`: what to download and how to start. Public on purpose: the CLI
+/// is the open-source client of this relay with no key, token or address
+/// inside; everything it can do needs a Keycloak login with the operator role
+/// (`rustlitel login`). Keeping the page public lets someone who has no CLI yet
+/// fetch it with plain curl. The installers stay behind auth: they carry join keys.
+pub async fn cli_page(State(state): State<Arc<AppState>>) -> Response {
+    let origin = state.public_origin.clone().unwrap_or_default();
+    let dir = std::path::Path::new(&state.agents_dir).join("cli");
+    let mut rows = String::new();
+    for (file, label) in CLI_FILES {
+        let Some((sha, size)) = sha256_of_file(&dir.join(file)).await else {
+            continue;
+        };
+        rows.push_str(&format!(
+            "<tr><td><a href=\"/cli/{file}\">{file}</a></td><td>{label}</td><td>{:.1} MB</td><td><code>{sha}</code></td></tr>\n",
+            size as f64 / 1e6
+        ));
+    }
+    let html = format!(
+        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>rustlitel CLI</title><style>body{{font:15px/1.5 system-ui,sans-serif;max-width:60rem;margin:2rem auto;padding:0 1rem}}
+table{{border-collapse:collapse;width:100%}}td,th{{border-bottom:1px solid #8884;padding:.4rem;text-align:left;vertical-align:top}}
+code,pre{{font:13px ui-monospace,monospace;word-break:break-all}}pre{{background:#8881;padding:.8rem;overflow-x:auto}}</style></head><body>
+<h1>rustlitel CLI</h1>
+<p>The console client of this relay: list agents, run commands, take screenshots, manage windows. Build <code>{build}</code>.</p>
+<table><tr><th>File</th><th>Platform</th><th>Size</th><th>SHA-256</th></tr>
+{rows}</table>
+<h2>Install</h2>
+<pre># macOS
+curl -fLo rustlitel {origin}/cli/rustlitel-macos && chmod +x rustlitel && xattr -c rustlitel
+# Linux
+curl -fLo rustlitel {origin}/cli/rustlitel-linux-amd64 && chmod +x rustlitel
+# Windows (PowerShell)
+Invoke-WebRequest {origin}/cli/rustlitel-windows-amd64.exe -OutFile rustlitel.exe</pre>
+<h2>Use</h2>
+<pre>./rustlitel --relay {origin} login     # Keycloak device login, once
+./rustlitel agents
+./rustlitel exec &lt;agent&gt; "Get-Process | Select -First 5"
+./rustlitel windows &lt;agent&gt;
+./rustlitel screenshot &lt;agent&gt; -o screen.png
+./rustlitel screenshot &lt;agent&gt; --title Notepad -o notepad.png
+./rustlitel window &lt;agent&gt; focus --title Notepad</pre>
+</body></html>"#,
+        build = rustlitel_proto::BUILD_ID,
+    );
+    ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], html).into_response()
+}
+
+/// `GET /cli/:file`: one of [`CLI_FILES`], nothing else from that directory.
+pub async fn cli_download(State(state): State<Arc<AppState>>, Path(file): Path<String>) -> Response {
+    if !CLI_FILES.iter().any(|(f, _)| *f == file) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let path = std::path::Path::new(&state.agents_dir).join("cli").join(&file);
+    stream_file(&path, &file, Vec::new())
+        .await
+        .unwrap_or_else(|| (StatusCode::NOT_FOUND, "not built into this image").into_response())
 }
 
 #[derive(Deserialize)]
@@ -1118,6 +1302,7 @@ async fn handle_agent_control(socket: WebSocket, state: Arc<AppState>) {
                 os: hello.os.clone(),
                 shells: hello.shells.clone(),
                 allow_remote: hello.allow_remote,
+                capabilities: hello.capabilities.clone(),
                 connected_at: Instant::now(),
                 commands: cmd_tx,
             },
