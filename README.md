@@ -210,8 +210,9 @@ desktop request it starts a copy of itself (`desktop-helper`, still
 LocalSystem) inside a user's session, so it sees what that user sees and can act
 on elevated windows too. By default that is the console session when someone is
 logged on there, else the active RDP session; `"session": <id>` picks any
-session with a user (`"action":"sessions"` lists them). A disconnected session is
-not drawn by Windows: its screenshot comes back black, with a `warning`.
+session with a user (`"action":"sessions"` lists them). Windows does not draw a
+disconnected session; its screenshot is assembled from its windows' own
+rendering (`"composed": true` and a `warning` in the answer).
 
 ```bash
 curl -s $RELAY/api/desktop -H "Authorization: Bearer $OP" -H 'Content-Type: application/json' \

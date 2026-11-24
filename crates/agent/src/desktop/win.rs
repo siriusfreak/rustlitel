@@ -215,7 +215,8 @@ fn run_helper(req: &[u8], asked: Option<u32>, timeout_secs: u64) -> Result<Strin
                         if row.state != WTSActive {
                             v["warning"] = json!(
                                 "this session is not active (no one is connected to it): Windows does not draw \
-                                 a disconnected session, so screenshots of it come out black or stale"
+                                 it, so a screen capture is assembled from its windows (no shadows or \
+                                 transparency, a window that does not paint itself stays black)"
                             );
                         }
                     }
@@ -332,6 +333,7 @@ pub fn helper(req: DesktopRequest) -> Result<Value> {
             Ok(json!({ "windows": windows, "monitors": monitors_json() }))
         }
         DesktopRequest::Screenshot { window, monitor, format, quality, max_width } => {
+            let mut composed = false;
             let format = format.unwrap_or_else(|| "png".into()).to_ascii_lowercase();
             let (img, win) = match window {
                 Some(t) => {
@@ -353,7 +355,15 @@ pub fn helper(req: DesktopRequest) -> Result<Value> {
                             .ok_or_else(|| anyhow!("no monitor {i} (there are {})", monitors().len()))?,
                         None => virtual_screen(),
                     };
-                    (capture_screen(&r)?, None)
+                    // A disconnected session has no screen to copy (access
+                    // denied, or black): assemble it from its windows instead.
+                    match capture_screen(&r) {
+                        Ok(img) if !img.is_blank() => (img, None),
+                        _ => {
+                            composed = true;
+                            (compose(&r)?, None)
+                        }
+                    }
                 }
             };
             let img = img.downscale(max_width.unwrap_or(0));
@@ -364,6 +374,9 @@ pub fn helper(req: DesktopRequest) -> Result<Value> {
             });
             if let Some(w) = win {
                 v["window"] = w;
+            }
+            if composed {
+                v["composed"] = json!(true);
             }
             Ok(v)
         }
@@ -474,34 +487,87 @@ unsafe fn blit(reference: HDC, w: i32, h: i32, draw: impl FnOnce(HDC) -> bool) -
     })
 }
 
-/// A window as it draws itself (PrintWindow renders it even when covered),
-/// cropped to its visible frame; falls back to the screen area it occupies.
-fn capture_window(h: HWND) -> Result<Bgra> {
-    if unsafe { IsIconic(h) } != 0 {
-        bail!("the window is minimized; `window restore` or `window focus` it first");
-    }
+/// A window as it draws itself (PrintWindow renders it even when covered,
+/// and in a disconnected session), cropped to its visible frame. Returns the
+/// image and the frame's screen position.
+fn print_window(h: HWND) -> Result<(Bgra, RECT)> {
     let wr = window_rect(h);
     let (w, hh) = (wr.right - wr.left, wr.bottom - wr.top);
     if w <= 0 || hh <= 0 {
         bail!("the window has no area");
     }
     let frame = frame_rect(h).unwrap_or(wr);
-    let printed = unsafe {
+    let img = unsafe {
         let screen = GetDC(null_mut());
-        let r = blit(screen, w, hh, |mem| PrintWindow(h, mem, PW_RENDERFULLCONTENT) != 0);
+        let mut r = blit(screen, w, hh, |mem| PrintWindow(h, mem, PW_RENDERFULLCONTENT) != 0);
+        if r.as_ref().map_or(true, |i| i.is_blank()) {
+            // Without DWM (a disconnected session) the full-content flag can
+            // come back empty; the classic WM_PRINT path still draws.
+            r = blit(screen, w, hh, |mem| PrintWindow(h, mem, 0) != 0);
+        }
         ReleaseDC(null_mut(), screen);
-        r
+        r?
     };
-    let img = match printed {
-        Ok(img) if !img.is_blank() => img.crop(
-            (frame.left - wr.left).max(0) as u32,
-            (frame.top - wr.top).max(0) as u32,
-            (frame.right - frame.left) as u32,
-            (frame.bottom - frame.top) as u32,
-        ),
-        _ => capture_screen(&frame)?,
-    };
-    Ok(img)
+    if img.is_blank() {
+        bail!("the window drew nothing");
+    }
+    let img = img.crop(
+        (frame.left - wr.left).max(0) as u32,
+        (frame.top - wr.top).max(0) as u32,
+        (frame.right - frame.left) as u32,
+        (frame.bottom - frame.top) as u32,
+    );
+    Ok((img, frame))
+}
+
+/// One window; falls back to the screen area it occupies.
+fn capture_window(h: HWND) -> Result<Bgra> {
+    if unsafe { IsIconic(h) } != 0 {
+        bail!("the window is minimized; `window restore` or `window focus` it first");
+    }
+    match print_window(h) {
+        Ok((img, _)) => Ok(img),
+        Err(_) => {
+            let frame = frame_rect(h).unwrap_or_else(|| window_rect(h));
+            capture_screen(&frame)
+        }
+    }
+}
+
+/// The area `r` assembled from the windows' own rendering, bottom of the
+/// z-order first: what the screen would show, for a session Windows does not
+/// draw (disconnected RDP). DWM-only effects (shadows, transparency) are missing.
+fn compose(r: &RECT) -> Result<Bgra> {
+    let (w, h) = ((r.right - r.left).max(0) as u32, (r.bottom - r.top).max(0) as u32);
+    if w == 0 || h == 0 {
+        bail!("empty capture area");
+    }
+    let mut canvas = Bgra { width: w, height: h, data: vec![0u8; (w * h * 4) as usize] };
+    let mut drawn = 0;
+    for hw in top_windows().into_iter().rev() {
+        unsafe {
+            if IsWindowVisible(hw) == 0 || IsIconic(hw) != 0 {
+                continue;
+            }
+            let mut cloaked = 0u32;
+            DwmGetWindowAttribute(hw, DWMWA_CLOAKED as u32, &mut cloaked as *mut _ as *mut c_void, 4);
+            if cloaked != 0 {
+                continue;
+            }
+        }
+        let f = frame_rect(hw).unwrap_or_else(|| window_rect(hw));
+        if f.right <= r.left || f.bottom <= r.top || f.left >= r.right || f.top >= r.bottom {
+            continue;
+        }
+        if let Ok((img, frame)) = print_window(hw) {
+            canvas.paste(&img, frame.left - r.left, frame.top - r.top);
+            drawn += 1;
+        }
+    }
+    if drawn == 0 {
+        bail!("nothing to capture: the session has no visible window that draws itself");
+    }
+    Ok(canvas)
 }
 
 fn window_rect(h: HWND) -> RECT {

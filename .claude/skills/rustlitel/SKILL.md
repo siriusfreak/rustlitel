@@ -82,9 +82,22 @@ rustlitel screenshot <agent> --session 3 -o rdp.png   # that session's screen
 rustlitel screenshot <agent> --all-sessions           # one file per logged-on session (-s<id>)
 ```
 By default the agent acts in the console session if someone is logged on there,
-else the active RDP session. `windows` and `window` take `--session` too.
-A **disconnected** session (`state disconnected`) is not drawn by Windows: its
-screenshot comes back black or stale and the CLI prints a warning.
+else the active RDP session; when the only user sessions are disconnected RDP
+ones (common on the servers), pass `--session <id>` from `sessions`.
+`windows` and `window` take `--session` too.
+
+A **disconnected** session (`state disconnected`) is not drawn by Windows, so
+the agent **assembles the screenshot from that session's windows** (each window
+renders itself; the answer has `composed: true` and the CLI prints a warning).
+Shadows and transparency are missing, and a window that can't paint itself stays
+black. A single window (`--hwnd`/`--title`) in a disconnected session usually
+captures perfectly; prefer that when you know what you are looking for.
+
+If a request to an *active* session times out ("desktop helper timed out"), the
+session itself may be wedged (nothing new can start in it, e.g. a stuck lock
+screen); check with `exec` whether any process started there recently
+(`Get-CimInstance Win32_Process | ? SessionId -eq <id> | sort CreationDate`).
+Don't log the user off to fix it without asking.
 
 ## Manage windows (Windows agents)
 

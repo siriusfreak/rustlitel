@@ -188,6 +188,28 @@ impl Bgra {
         }
     }
 
+    /// Draw `src` with its top-left corner at (`x`, `y`), clipped to self.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn paste(&mut self, src: &Bgra, x: i32, y: i32) {
+        let (dw, dh) = (self.width as i64, self.height as i64);
+        let x0 = (x as i64).max(0);
+        let x1 = (x as i64 + src.width as i64).min(dw);
+        if x1 <= x0 {
+            return;
+        }
+        let n = ((x1 - x0) * 4) as usize;
+        let sx = ((x0 - x as i64) * 4) as usize;
+        for row in 0..src.height as i64 {
+            let dy = y as i64 + row;
+            if dy < 0 || dy >= dh {
+                continue;
+            }
+            let s = (row * src.width as i64 * 4) as usize + sx;
+            let d = ((dy * dw + x0) * 4) as usize;
+            self.data[d..d + n].copy_from_slice(&src.data[s..s + n]);
+        }
+    }
+
     /// True if every pixel is black (what PrintWindow gives for some windows).
     #[cfg_attr(not(windows), allow(dead_code))]
     pub fn is_blank(&self) -> bool {
@@ -257,6 +279,16 @@ mod tests {
         let c = img(10, 10).crop(2, 3, 100, 4);
         assert_eq!((c.width, c.height), (8, 4));
         assert_eq!(c.data.len(), 8 * 4 * 4);
+    }
+
+    #[test]
+    fn paste_clips() {
+        let mut canvas = Bgra { width: 4, height: 4, data: vec![0; 64] };
+        let src = Bgra { width: 3, height: 3, data: vec![9; 36] };
+        canvas.paste(&src, -1, 2);
+        let px = |x: usize, y: usize| canvas.data[(y * 4 + x) * 4];
+        assert_eq!((px(0, 2), px(1, 3), px(2, 2), px(0, 1)), (9, 9, 0, 0));
+        canvas.paste(&src, 10, 10); // fully outside: no panic
     }
 
     #[test]

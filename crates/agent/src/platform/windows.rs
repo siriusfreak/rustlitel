@@ -387,11 +387,63 @@ pub fn apply_update(new_bytes: &[u8]) -> anyhow::Result<()> {
     let script = format!("Start-Sleep -Seconds 1; Restart-Service -Name {SERVICE_NAME} -Force");
     std::process::Command::new("powershell.exe")
         .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
         .spawn()
         .context("spawn restart helper")?;
     tracing::info!("self-update swapped in; service restarting on the new binary");
+
+    // Until 2026-11-24 that helper was all there was, and on every machine it
+    // silently never ran: each agent kept the old build in memory with the new
+    // one on disk. If we are still here after 20 s, exit without telling the
+    // SCM: it counts that as a failure and restarts us (recovery actions set
+    // by `ensure_recovery`), now from the new binary.
+    // Only with recovery actions in place: otherwise the exit would leave the
+    // service stopped and the machine out of reach.
+    if !RECOVERY_SET.load(std::sync::atomic::Ordering::SeqCst) {
+        return Ok(());
+    }
+    std::thread::spawn(|| {
+        std::thread::sleep(Duration::from_secs(20));
+        tracing::warn!("restart helper did not restart the service; exiting for SCM recovery");
+        std::process::exit(3);
+    });
     Ok(())
+}
+
+/// Set once `ensure_recovery` succeeded in this (service) process.
+static RECOVERY_SET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Make the SCM restart the service when it dies without a clean stop: a
+/// crash, or `apply_update` exiting to move onto a new binary. Installs from
+/// before 2026-11-24 have no recovery actions, so every start sets them.
+fn ensure_recovery() {
+    use windows_service::service::{
+        ServiceAction, ServiceActionType, ServiceFailureActions, ServiceFailureResetPeriod,
+    };
+    let set = || -> windows_service::Result<()> {
+        let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
+        let service = manager.open_service(
+            SERVICE_NAME,
+            ServiceAccess::CHANGE_CONFIG | ServiceAccess::START | ServiceAccess::QUERY_CONFIG,
+        )?;
+        let restart = |secs| ServiceAction {
+            action_type: ServiceActionType::Restart,
+            delay: Duration::from_secs(secs),
+        };
+        service.update_failure_actions(ServiceFailureActions {
+            reset_period: ServiceFailureResetPeriod::After(Duration::from_secs(86400)),
+            reboot_msg: None,
+            command: None,
+            actions: Some(vec![restart(5), restart(15), restart(60)]),
+        })
+    };
+    match set() {
+        Ok(()) => RECOVERY_SET.store(true, std::sync::atomic::Ordering::SeqCst),
+        Err(e) => tracing::warn!("could not set the service recovery actions: {e}"),
+    }
 }
 
 /// Retry a file operation for up to 5 s: an antivirus keeps a freshly written
@@ -463,6 +515,7 @@ fn service_body(args: RunArgs) -> windows_service::Result<()> {
         ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN,
     ))?;
     tracing::info!("service running");
+    ensure_recovery();
 
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     rt.block_on(async {
