@@ -25,7 +25,7 @@ use windows_sys::Win32::System::RemoteDesktop::{
     ProcessIdToSessionId, WTSActive, WTSEnumerateSessionsW, WTSFreeMemory, WTSGetActiveConsoleSessionId,
     WTSQuerySessionInformationW, WTSUserName, WTS_CURRENT_SERVER_HANDLE, WTS_SESSION_INFOW,
 };
-use windows_sys::Win32::System::StationsAndDesktops::{OpenInputDesktop, SetThreadDesktop};
+use windows_sys::Win32::System::StationsAndDesktops::{GetThreadDesktop, OpenInputDesktop, SetThreadDesktop};
 use windows_sys::Win32::System::Threading::{
     CreateProcessAsUserW, GetCurrentProcess, GetCurrentProcessId, GetCurrentThreadId, GetExitCodeProcess,
     OpenProcess, OpenProcessToken, QueryFullProcessImageNameW, TerminateProcess, WaitForSingleObject,
@@ -343,6 +343,7 @@ pub fn helper(req: DesktopRequest) -> Result<Value> {
                 None => {
                     // Follow the input desktop, so a lock screen or a UAC prompt
                     // shows up as what it is instead of a stale picture.
+                    let own_desktop = unsafe { GetThreadDesktop(GetCurrentThreadId()) };
                     unsafe {
                         let d = OpenInputDesktop(0, FALSE, GENERIC_ALL);
                         if !d.is_null() {
@@ -360,6 +361,9 @@ pub fn helper(req: DesktopRequest) -> Result<Value> {
                     match capture_screen(&r) {
                         Ok(img) if !img.is_blank() => (img, None),
                         _ => {
+                            // The windows live on the session's own desktop,
+                            // not necessarily on the input one we moved to.
+                            unsafe { SetThreadDesktop(own_desktop) };
                             composed = true;
                             (compose(&r)?, None)
                         }
