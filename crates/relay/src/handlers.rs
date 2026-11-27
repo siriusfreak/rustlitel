@@ -243,7 +243,9 @@ pub async fn oidc_logout(State(state): State<Arc<AppState>>, headers: HeaderMap)
     let clear = state.auth.clear_cookie_header();
 
     if let Some(oidc) = state.oidc.as_ref() {
-        let post = state.origin_for(&headers).unwrap_or("/").to_string();
+        // `<origin>/`: Keycloak compares post_logout_redirect_uri literally
+        // with the registered ones, which end in `/`.
+        let post = format!("{}/", state.origin_for(&headers).unwrap_or(""));
         if let Some(url) = oidc.logout_url(&post).await {
             let mut resp = Redirect::to(&url).into_response();
             resp.headers_mut()
