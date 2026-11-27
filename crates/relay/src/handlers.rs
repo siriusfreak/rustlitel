@@ -126,12 +126,15 @@ pub struct OidcLoginQuery {
 /// Start the Keycloak Authorization Code flow.
 pub async fn oidc_login(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Query(q): Query<OidcLoginQuery>,
 ) -> Response {
     let Some(oidc) = state.oidc.as_ref() else {
         return (StatusCode::NOT_FOUND, "OIDC is not enabled").into_response();
     };
-    match oidc.begin_login(q.rd.as_deref().unwrap_or("/")).await {
+    // Come back to the name the browser is on: the session cookie is host-only.
+    let redirect_uri = oidc.redirect_uri_for(state.origin_for(&headers));
+    match oidc.begin_login(q.rd.as_deref().unwrap_or("/"), &redirect_uri).await {
         Ok((url, login_cookie)) => {
             let mut resp = Redirect::to(&url).into_response();
             resp.headers_mut().insert(
@@ -240,7 +243,7 @@ pub async fn oidc_logout(State(state): State<Arc<AppState>>, headers: HeaderMap)
     let clear = state.auth.clear_cookie_header();
 
     if let Some(oidc) = state.oidc.as_ref() {
-        let post = state.public_origin.clone().unwrap_or_else(|| "/".into());
+        let post = state.origin_for(&headers).unwrap_or("/").to_string();
         if let Some(url) = oidc.logout_url(&post).await {
             let mut resp = Redirect::to(&url).into_response();
             resp.headers_mut()
@@ -294,11 +297,11 @@ async fn api_authed(state: &AppState, headers: &HeaderMap) -> bool {
 }
 
 fn origin_ok(state: &AppState, headers: &HeaderMap) -> bool {
-    let Some(expected) = state.public_origin.as_deref() else {
+    if state.public_origins.is_empty() {
         return true; // not configured -> skip (local dev; prod refuses to start unset)
-    };
+    }
     match headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
-        Some(o) => o == expected,
+        Some(o) => crate::origins::allowed(&state.public_origins, o),
         None => false,
     }
 }
@@ -580,8 +583,8 @@ const CLI_FILES: &[(&str, &str)] = &[
 /// inside; everything it can do needs a Keycloak login with the operator role
 /// (`rustlitel login`). Keeping the page public lets someone who has no CLI yet
 /// fetch it with plain curl. The installers stay behind auth: they carry join keys.
-pub async fn cli_page(State(state): State<Arc<AppState>>) -> Response {
-    let origin = state.public_origin.clone().unwrap_or_default();
+pub async fn cli_page(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    let origin = state.origin_for(&headers).unwrap_or_default().to_string();
     let dir = std::path::Path::new(&state.agents_dir).join("cli");
     let mut rows = String::new();
     for (file, label) in CLI_FILES {
@@ -745,7 +748,7 @@ pub async fn make_installer(
     let Some((base_file, _)) = installer_bases(os) else {
         return (StatusCode::BAD_REQUEST, "unknown os").into_response();
     };
-    let Some(origin) = state.public_origin.as_deref() else {
+    let Some(origin) = state.origin_for(&headers) else {
         return (StatusCode::SERVICE_UNAVAILABLE, "RUSTLITEL_PUBLIC_ORIGIN is not set").into_response();
     };
     // Don't hand out a link to a binary we don't actually have bundled.
@@ -800,19 +803,21 @@ pub struct InstallerDownloadQuery {
 /// (so the link works when opened on a machine with no operator session).
 pub async fn download_installer(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Query(q): Query<InstallerDownloadQuery>,
 ) -> Response {
     if !join_key_ok(&state, &q.key) {
         return (StatusCode::FORBIDDEN, "invalid or expired installer link").into_response();
     }
     let os = q.os.as_deref().unwrap_or("windows");
-    serve_baked(&state, os, q.name, q.key).await
+    serve_baked(&state, &headers, os, q.name, q.key).await
 }
 
 /// Serve the baked installer for a link `/i/<code>`. Unauthenticated: the signed,
 /// unexpired code is the capability, and the join key is minted here.
 pub async fn download_short(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Path(code): Path<String>,
 ) -> Response {
     let link = crate::installer::open_link(&state.agent_token, &code)
@@ -822,12 +827,14 @@ pub async fn download_short(
     };
     let label = link.name.as_deref().unwrap_or("installer");
     let key = crate::installer::mint_join_key(&state.agent_token, label, link.key_ttl_days * 86400);
-    serve_baked(&state, &link.os, link.name, key).await
+    serve_baked(&state, &headers, &link.os, link.name, key).await
 }
 
-/// Stream the installer binary for `os` with the given name + join key.
+/// Stream the installer binary for `os` with the given name + join key. The
+/// agent dials the public name the installer was downloaded from.
 async fn serve_baked(
     state: &AppState,
+    headers: &HeaderMap,
     os: &str,
     name: Option<String>,
     key: String,
@@ -835,7 +842,7 @@ async fn serve_baked(
     let Some((base_file, out_file)) = installer_bases(os) else {
         return (StatusCode::BAD_REQUEST, "unknown os").into_response();
     };
-    let Some(origin) = state.public_origin.as_deref() else {
+    let Some(origin) = state.origin_for(headers) else {
         return (StatusCode::SERVICE_UNAVAILABLE, "RUSTLITEL_PUBLIC_ORIGIN is not set").into_response();
     };
     let Some(relay_ws) = crate::installer::origin_to_ws(origin) else {

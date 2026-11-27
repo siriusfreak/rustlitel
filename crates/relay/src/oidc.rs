@@ -128,6 +128,11 @@ struct LoginState {
     nonce: String,
     pkce_verifier: String,
     return_to: String,
+    /// The `redirect_uri` sent to the authorize endpoint; the token exchange
+    /// must repeat it exactly. Empty in cookies from before multi-origin
+    /// support, which used the configured one.
+    #[serde(default)]
+    redirect_uri: String,
     /// Unix seconds when this login attempt expires.
     exp: u64,
 }
@@ -177,7 +182,25 @@ impl Oidc {
     }
 
     /// Build the authorize URL and the signed login-state cookie value to set.
-    pub async fn begin_login(&self, return_to: &str) -> anyhow::Result<(String, String)> {
+    /// The `redirect_uri` for a login started on `origin`: that origin plus the
+    /// path of `RUSTLITEL_OIDC_REDIRECT_URL`, so a browser that came in on
+    /// another public name comes back to the same one (its session cookie is
+    /// host-only). Without an origin, the configured URL as is.
+    pub fn redirect_uri_for(&self, origin: Option<&str>) -> String {
+        let Some(origin) = origin else {
+            return self.cfg.redirect_url.clone();
+        };
+        let path = Url::parse(&self.cfg.redirect_url)
+            .map(|u| u.path().to_string())
+            .unwrap_or_else(|_| "/oauth2/callback".into());
+        format!("{}{}", origin.trim_end_matches('/'), path)
+    }
+
+    pub async fn begin_login(
+        &self,
+        return_to: &str,
+        redirect_uri: &str,
+    ) -> anyhow::Result<(String, String)> {
         let disc = self.discovery().await?;
         let state = rand_tok();
         let nonce = rand_tok();
@@ -189,6 +212,7 @@ impl Oidc {
             nonce: nonce.clone(),
             pkce_verifier: verifier,
             return_to: sanitize_return(return_to),
+            redirect_uri: redirect_uri.to_string(),
             exp: now() + LOGIN_TTL_SECS,
         };
         let cookie = self.sign_state(&ls);
@@ -197,7 +221,7 @@ impl Oidc {
         u.query_pairs_mut()
             .append_pair("response_type", "code")
             .append_pair("client_id", &self.cfg.client_id)
-            .append_pair("redirect_uri", &self.cfg.redirect_url)
+            .append_pair("redirect_uri", redirect_uri)
             .append_pair("scope", "openid profile")
             .append_pair("state", &state)
             .append_pair("nonce", &nonce)
@@ -230,12 +254,17 @@ impl Oidc {
         }
 
         let disc = self.discovery().await?;
+        let redirect_uri = if ls.redirect_uri.is_empty() {
+            self.cfg.redirect_url.as_str()
+        } else {
+            ls.redirect_uri.as_str()
+        };
         // client auth via HTTP Basic (client_secret_basic), so client_id/secret
         // are not repeated in the body.
         let params = [
             ("grant_type", "authorization_code"),
             ("code", code),
-            ("redirect_uri", self.cfg.redirect_url.as_str()),
+            ("redirect_uri", redirect_uri),
             ("code_verifier", ls.pkce_verifier.as_str()),
         ];
         let resp = self
@@ -585,12 +614,14 @@ mod tests {
             nonce: "no".into(),
             pkce_verifier: "ve".into(),
             return_to: "/".into(),
+            redirect_uri: "https://r2/oauth2/callback".into(),
             exp: now() + 60,
         };
         let token = o.sign_state(&ls);
         let back = o.verify_state(&token).expect("verify");
         assert_eq!(back.state, "st");
         assert_eq!(back.pkce_verifier, "ve");
+        assert_eq!(back.redirect_uri, "https://r2/oauth2/callback");
         // Tamper → reject.
         let mut bad = token.clone();
         bad.push('x');
@@ -627,5 +658,33 @@ mod tests {
         assert!(c.validate().is_err());
         c.issuer = "http://localhost:8080/realms/main".into();
         assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn redirect_uri_follows_origin() {
+        let o = Oidc::new(cfg(), "k".into());
+        assert_eq!(o.redirect_uri_for(None), "https://r/oauth2/callback");
+        assert_eq!(
+            o.redirect_uri_for(Some("https://remote.siriusfrk.me")),
+            "https://remote.siriusfrk.me/oauth2/callback"
+        );
+        assert_eq!(
+            o.redirect_uri_for(Some("https://remote.siriusfrk.ru/")),
+            "https://remote.siriusfrk.ru/oauth2/callback"
+        );
+    }
+
+    #[test]
+    fn login_state_without_redirect_uri_still_verifies() {
+        // A cookie signed by the previous release (no redirect_uri field).
+        let o = Oidc::new(cfg(), "server-secret".into());
+        let json = serde_json::json!({
+            "state": "st", "nonce": "no", "pkce_verifier": "ve",
+            "return_to": "/", "exp": now() + 60,
+        });
+        let pb = B64U.encode(serde_json::to_vec(&json).unwrap());
+        let token = format!("{pb}.{}", o.state_mac(pb.as_bytes()));
+        let back = o.verify_state(&token).expect("old cookie verifies");
+        assert_eq!(back.redirect_uri, "");
     }
 }

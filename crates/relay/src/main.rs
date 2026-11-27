@@ -10,6 +10,7 @@ mod auth;
 mod handlers;
 mod installer;
 mod oidc;
+mod origins;
 mod state;
 mod ui;
 
@@ -36,7 +37,7 @@ async fn main() -> anyhow::Result<()> {
     let listen = env_or("RUSTLITEL_LISTEN_ADDR", "0.0.0.0:8080");
     let operator_token = require_token("RUSTLITEL_OPERATOR_TOKEN")?;
     let agent_token = require_token("RUSTLITEL_AGENT_TOKEN")?;
-    let public_origin = std::env::var("RUSTLITEL_PUBLIC_ORIGIN").ok().filter(|s| !s.is_empty());
+    let public_origins = origins::parse(&env_or("RUSTLITEL_PUBLIC_ORIGIN", ""));
     let ttl_hours: u64 = env_or("RUSTLITEL_SESSION_TTL_HOURS", "720").parse().unwrap_or(720);
     let cookie_secure = env_or("RUSTLITEL_COOKIE_SECURE", "1") != "0";
     let max_agents: usize = env_or("RUSTLITEL_MAX_AGENTS", "512").parse().unwrap_or(512);
@@ -70,11 +71,11 @@ async fn main() -> anyhow::Result<()> {
     // Fail closed in production: behind TLS (secure cookies) we cannot enforce
     // the WebSocket/login Origin check without knowing our own origin, so
     // require it to be set rather than silently skipping the check.
-    if cookie_secure && public_origin.is_none() {
+    if cookie_secure && public_origins.is_empty() {
         anyhow::bail!(
             "RUSTLITEL_PUBLIC_ORIGIN must be set when RUSTLITEL_COOKIE_SECURE is on \
              (production), so Origin checks are enforced; set it to e.g. \
-             https://relay.example.com, or set RUSTLITEL_COOKIE_SECURE=0 for local HTTP"
+             https://relay.example.com (a comma-separated list for several names), or set RUSTLITEL_COOKIE_SECURE=0 for local HTTP"
         );
     }
 
@@ -114,7 +115,7 @@ async fn main() -> anyhow::Result<()> {
         ),
         agent_token,
         revoked_keys,
-        public_origin: public_origin.clone(),
+        public_origins: public_origins.clone(),
         open_timeout_secs,
         exec_output_cap,
         exec_default_timeout_secs,
@@ -158,7 +159,7 @@ async fn main() -> anyhow::Result<()> {
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&listen).await?;
-    tracing::info!(%listen, origin = ?public_origin, "rustlitel-relay listening");
+    tracing::info!(%listen, origins = ?public_origins, "rustlitel-relay listening");
 
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())

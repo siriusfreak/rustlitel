@@ -113,9 +113,10 @@ pub struct AppState {
     /// Fingerprints ([`crate::installer::key_fingerprint`]) of join keys that are
     /// signed and unexpired but must no longer be accepted.
     pub revoked_keys: std::collections::HashSet<String>,
-    /// Expected browser Origin for WS upgrades and login, or `None` to skip the
-    /// check (local dev). e.g. `https://relay.example.com`.
-    pub public_origin: Option<String>,
+    /// Public origins (`RUSTLITEL_PUBLIC_ORIGIN`, comma-separated), e.g.
+    /// `https://relay.example.com`. A browser Origin must be one of them; empty
+    /// skips the check (local dev). See [`crate::origins`].
+    pub public_origins: Vec<String>,
     /// How long the operator waits for an agent to accept + dial before giving
     /// up, in seconds.
     pub open_timeout_secs: u64,
@@ -139,6 +140,15 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// The public origin this request is served on: the listed one its `Host`
+    /// names, else the first; `None` when none is configured.
+    pub fn origin_for(&self, headers: &axum::http::HeaderMap) -> Option<&str> {
+        let host = headers
+            .get(axum::http::header::HOST)
+            .and_then(|v| v.to_str().ok());
+        crate::origins::pick(&self.public_origins, host)
+    }
+
     /// Drop a session from the table. Both bridge handlers call this on exit;
     /// removing an absent id is a no-op, so a double call is harmless.
     pub async fn remove_session(&self, id: &Uuid) {

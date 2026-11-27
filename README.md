@@ -110,7 +110,7 @@ Open <http://127.0.0.1:8099>, sign in with the operator token.
 | `RUSTLITEL_LISTEN_ADDR` | `0.0.0.0:8080` | bind address |
 | `RUSTLITEL_OPERATOR_TOKEN` | *(required)* | operator login / Bearer token |
 | `RUSTLITEL_AGENT_TOKEN` | *(required)* | agent enrollment token (must differ) |
-| `RUSTLITEL_PUBLIC_ORIGIN` | *(unset)* | e.g. `https://relay.example.com`; enables Origin checks |
+| `RUSTLITEL_PUBLIC_ORIGIN` | *(unset)* | e.g. `https://relay.example.com`; enables Origin checks. A comma-separated list (`https://a.example,https://b.example`) serves one relay under several names: each request uses the listed origin its `Host` names (else the first) for the OIDC redirect, logout, installer links and the relay URL baked into installers, and any listed origin passes the Origin check |
 | `RUSTLITEL_SESSION_TTL_HOURS` | `720` | operator session lifetime (signed cookie, survives a relay restart; rotate the operator token to end all sessions) |
 | `RUSTLITEL_SHORT_LINK_TTL_DAYS` | `30` | installer link lifetime (signed, survives a relay restart; refuse one by adding the SHA-256 of its code to `RUSTLITEL_REVOKED_KEYS`) |
 | `RUSTLITEL_COOKIE_SECURE` | `1` | set `0` only for local HTTP |
@@ -130,7 +130,7 @@ the Bearer operator token regardless.
 | `RUSTLITEL_OIDC_ISSUER` | e.g. `https://keycloak.example/realms/main` |
 | `RUSTLITEL_OIDC_CLIENT_ID` | confidential client id |
 | `RUSTLITEL_OIDC_CLIENT_SECRET` | client secret |
-| `RUSTLITEL_OIDC_REDIRECT_URL` | `https://<host>/oauth2/callback` |
+| `RUSTLITEL_OIDC_REDIRECT_URL` | `https://<host>/oauth2/callback`; with several public origins only its path counts: the login uses `<request's origin><path>`, so register that callback for every origin in the IdP |
 | `RUSTLITEL_OIDC_ALLOWED_GROUP` | required group/role claim value (optional) |
 | `RUSTLITEL_OIDC_USERNAME_CLAIM` | default `preferred_username` |
 | `RUSTLITEL_OIDC_GROUPS_CLAIM` | default `groups` (also checks `realm_access.roles`) |
